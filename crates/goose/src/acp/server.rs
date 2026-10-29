@@ -1602,7 +1602,7 @@ fn prompt_error_from_conversation(
 ) -> Option<agent_client_protocol::Error> {
     conversation
         .terminal_error()
-        .and_then(|error| prompt_error_from_message_content(&MessageContent::Error(error.clone())))
+        .and_then(prompt_error_from_message_content)
 }
 
 fn turn_failed_data() -> serde_json::Value {
@@ -3369,6 +3369,43 @@ print(\"hello, world\")
                 }
             })
         );
+    }
+
+    #[test]
+    fn saved_provider_credits_notification_preserves_prompt_error_payload() {
+        for top_up_url in [Some("https://provider.example/billing".to_string()), None] {
+            let credits = Message::from_provider_error(
+                &goose_providers::errors::ProviderError::CreditsExhausted {
+                    details: "balance empty".to_string(),
+                    top_up_url: top_up_url.clone(),
+                },
+            );
+            let expected = credits
+                .content
+                .iter()
+                .find_map(prompt_error_from_message_content)
+                .unwrap();
+            let mut conversation = Conversation::new_unvalidated([
+                Message::user().with_text("task"),
+                credits,
+                Message::assistant()
+                    .with_system_notification(SystemNotificationType::InlineMessage, "Stop cap"),
+            ]);
+            let error = prompt_error_from_conversation(&conversation)
+                .expect("credits must fail the saved turn");
+            assert_eq!(
+                serde_json::to_value(&error).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+            let data = error.data.unwrap();
+            assert_eq!(data["reason"], crate::acp::CREDITS_EXHAUSTED_REASON);
+            assert_eq!(
+                data.get("url").and_then(|url| url.as_str()),
+                top_up_url.as_deref()
+            );
+            conversation.push(Message::assistant().with_text("recovered"));
+            assert!(prompt_error_from_conversation(&conversation).is_none());
+        }
     }
 
     #[test]

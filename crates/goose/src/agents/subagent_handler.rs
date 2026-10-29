@@ -159,9 +159,16 @@ impl ForegroundSubagentRunner {
 }
 
 pub(crate) fn saved_outcome(conversation: &Conversation) -> Option<SubagentOutcome> {
-    if let Some(error) = conversation.terminal_error() {
+    if let Some(content) = conversation.terminal_error() {
+        let reason = match content {
+            MessageContent::Error(error) => format!("{:?}: {}", error.kind, error.message),
+            MessageContent::SystemNotification(notification) => {
+                format!("CreditsExhausted: {}", notification.msg)
+            }
+            _ => unreachable!("terminal_error returns only error content"),
+        };
         return Some(SubagentOutcome::Failed(with_progress(
-            &format!("{:?}: {}", error.kind, error.message),
+            &reason,
             conversation.messages(),
         )));
     }
@@ -542,6 +549,34 @@ mod outcome_tests {
         assert!(matches!(
             saved_outcome(&recovered),
             Some(SubagentOutcome::Completed(_))
+        ));
+    }
+
+    #[test]
+    fn provider_credits_notification_precedes_saved_worker_output() {
+        let mut saved = successful();
+        saved.push(Message::from_provider_error(
+            &goose_providers::errors::ProviderError::CreditsExhausted {
+                details: "balance empty".to_string(),
+                top_up_url: Some("https://provider.example/billing".to_string()),
+            },
+        ));
+        saved.push(
+            Message::assistant()
+                .with_system_notification(SystemNotificationType::InlineMessage, "Stop cap"),
+        );
+        assert!(matches!(
+            classify_outcome(Some(&saved), false, Ok(())),
+            SubagentOutcome::Failed(reason) if reason.contains("CreditsExhausted") && reason.contains("Please add credits")
+        ));
+        assert_eq!(
+            classify_outcome(Some(&saved), true, Ok(())),
+            SubagentOutcome::Cancelled
+        );
+        saved.push(Message::assistant().with_text("recovered"));
+        assert!(matches!(
+            classify_outcome(Some(&saved), false, Ok(())),
+            SubagentOutcome::Completed(_)
         ));
     }
 

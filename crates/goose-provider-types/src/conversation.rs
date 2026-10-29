@@ -43,23 +43,28 @@ impl Conversation {
         &self.0
     }
 
-    /// The typed terminal error in the latest user turn, ignoring notice-only records.
+    /// The original terminal error content in the latest user turn, ignoring notice-only records.
     /// A later substantive assistant response supersedes an earlier error.
-    pub fn terminal_error(&self) -> Option<&message::ErrorContent> {
+    pub fn terminal_error(&self) -> Option<&MessageContentBlock> {
         self.0
             .iter()
             .rev()
             .take_while(|message| message.role != Role::User)
             .find(|message| {
                 message.role == Role::Assistant
-                    && message.content.iter().any(|content| {
-                        !matches!(content, MessageContentBlock::SystemNotification(_))
-                    })
+                    && (message.error_kind().is_some()
+                        || message.content.iter().any(|content| {
+                            !matches!(content, MessageContentBlock::SystemNotification(_))
+                        }))
             })
             .and_then(|message| {
-                message.content.iter().find_map(|content| match content {
-                    MessageContentBlock::Error(error) => Some(error),
-                    _ => None,
+                message.content.iter().find(|content| match content {
+                    MessageContentBlock::Error(_) => true,
+                    MessageContentBlock::SystemNotification(notification) => {
+                        notification.notification_type
+                            == message::SystemNotificationType::CreditsExhausted
+                    }
+                    _ => false,
                 })
             })
     }
@@ -2042,6 +2047,39 @@ mod terminal_outcome_tests {
     use message::{MessageErrorKind, SystemNotificationType};
 
     #[test]
+    fn terminal_error_recognizes_provider_credits_notification() {
+        for top_up_url in [Some("https://provider.example/billing".to_string()), None] {
+            let credits =
+                Message::from_provider_error(&crate::errors::ProviderError::CreditsExhausted {
+                    details: "balance empty".to_string(),
+                    top_up_url,
+                });
+            let expected = credits.content[0].clone();
+            let mut conversation = Conversation::new_unvalidated([
+                Message::user().with_text("task"),
+                credits,
+                Message::assistant()
+                    .with_system_notification(SystemNotificationType::InlineMessage, "Stop cap"),
+            ]);
+            assert_eq!(
+                conversation.terminal_error(),
+                Some(&expected),
+                "preserve the producer payload"
+            );
+            conversation.push(Message::assistant().with_text("recovered"));
+            assert!(conversation.terminal_error().is_none());
+            conversation.push(Message::from_provider_error(
+                &crate::errors::ProviderError::CreditsExhausted {
+                    details: "empty again".to_string(),
+                    top_up_url: None,
+                },
+            ));
+            conversation.push(Message::user().with_text("next request"));
+            assert!(conversation.terminal_error().is_none());
+        }
+    }
+
+    #[test]
     fn terminal_error_is_typed_turn_bounded_and_ignores_only_notices() {
         for kind in [
             MessageErrorKind::Authentication,
@@ -2058,7 +2096,12 @@ mod terminal_outcome_tests {
                     .with_system_notification(SystemNotificationType::InlineMessage, "Stop cap"),
             );
             assert_eq!(
-                conversation.terminal_error().map(|error| error.kind),
+                conversation
+                    .terminal_error()
+                    .and_then(|content| match content {
+                        MessageContentBlock::Error(error) => Some(error.kind),
+                        _ => None,
+                    }),
                 Some(kind)
             );
             conversation.push(Message::assistant().with_text("recovered"));
