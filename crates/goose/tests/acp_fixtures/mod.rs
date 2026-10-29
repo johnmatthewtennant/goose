@@ -293,6 +293,41 @@ impl OpenAiFixture {
         }
     }
 
+    /// Responses requests first call the MCP tool, then receive the same final
+    /// response on every retry so an HTTP failure cannot accidentally recover.
+    pub async fn responses_after_tool(
+        tool_response: String,
+        final_response: ResponseTemplate,
+    ) -> Self {
+        let fixture = Self::new(vec![], Arc::new(goose_test_support::IgnoreSessionId)).await;
+        Mock::given(method("POST"))
+            .and(|request: &wiremock::Request| {
+                matches!(
+                    request.url.path(),
+                    "/v1/responses" | "/ai-gateway/openai/v1/responses"
+                )
+            })
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let has_tool_result = body["input"].as_array().unwrap().iter().any(|item| {
+                    item["type"] == "function_call_output"
+                        && item["output"]
+                            .as_str()
+                            .is_some_and(|output| output.contains(goose_test_support::FAKE_CODE))
+                });
+                if has_tool_result {
+                    final_response.clone()
+                } else {
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(&tool_response)
+                }
+            })
+            .mount(&fixture._server)
+            .await;
+        fixture
+    }
+
     pub fn uri(&self) -> &str {
         &self.base_url
     }

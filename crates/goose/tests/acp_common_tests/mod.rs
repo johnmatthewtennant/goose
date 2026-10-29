@@ -14,6 +14,7 @@ use fixtures::{
 };
 use fs_err as fs;
 use goose::acp::server::AcpProviderFactory;
+use goose::agents::tool_execution::DECLINED_RESPONSE;
 use goose::config::base::CONFIG_YAML_NAME;
 use goose::config::GooseMode;
 use goose::session::{EnabledExtensionsState, SessionManager};
@@ -345,7 +346,7 @@ pub async fn run_fs_write_text_file_false<C: Connection>() {
                 include_str!("../acp_test_data/openai_fs_write_tool_call.txt"),
             ),
             (
-                r#"Created /tmp/test_acp_write.txt"#.into(),
+                r#"/tmp/test_acp_write.txt (1 lines)"#.into(),
                 include_str!("../acp_test_data/openai_fs_write_tool_result.txt"),
             ),
         ],
@@ -365,7 +366,10 @@ pub async fn run_fs_write_text_file_false<C: Connection>() {
         .prompt(prompt, PermissionDecision::AllowOnce)
         .await
         .unwrap();
-    assert!(!output.text.is_empty());
+    assert_eq!(
+        output.text,
+        "Written to /tmp/test_acp_write.txt: test-write-content-67890"
+    );
     assert_eq!(
         fs::read_to_string("/tmp/test_acp_write.txt").unwrap(),
         "test-write-content-67890"
@@ -393,7 +397,7 @@ pub async fn run_fs_write_text_file_true<C: Connection>() {
                 include_str!("../acp_test_data/openai_fs_write_tool_call.txt"),
             ),
             (
-                r#"Created /tmp/test_acp_write.txt"#.into(),
+                r#"/tmp/test_acp_write.txt (1 lines)"#.into(),
                 include_str!("../acp_test_data/openai_fs_write_tool_result.txt"),
             ),
         ],
@@ -417,7 +421,10 @@ pub async fn run_fs_write_text_file_true<C: Connection>() {
         .prompt(prompt, PermissionDecision::AllowOnce)
         .await
         .unwrap();
-    assert!(!output.text.is_empty());
+    assert_eq!(
+        output.text,
+        "Written to /tmp/test_acp_write.txt: test-write-content-67890"
+    );
 
     let updates = session.session_updates();
     let initial_tool_call_id = updates
@@ -478,8 +485,8 @@ pub async fn run_load_mode<C: Connection>() {
                 include_str!("../acp_test_data/openai_tool_call.txt"),
             ),
             (
-                format!(r#""content":"{FAKE_CODE}""#),
-                include_str!("../acp_test_data/openai_tool_result.txt"),
+                format!(r#""content":"{DECLINED_RESPONSE}""#),
+                include_str!("../acp_test_data/openai_tool_declined.txt"),
             ),
         ],
         expected_session_id.clone(),
@@ -519,6 +526,7 @@ pub async fn run_load_mode<C: Connection>() {
         .await
         .unwrap();
     assert_eq!(output.tool_status.unwrap(), ToolCallStatus::Failed);
+    assert_eq!(output.text, "The tool call was declined. I will not retry it.");
     assert_notifications(
         &loaded.notifications(),
         &[
@@ -838,6 +846,14 @@ async fn run_mode_set_impl<C: Connection>(via: SetModeVia) {
                 include_str!("../acp_test_data/openai_tool_call.txt"),
             ),
             (
+                format!(r#""content":"{DECLINED_RESPONSE}""#),
+                include_str!("../acp_test_data/openai_tool_declined.txt"),
+            ),
+            (
+                prompt.to_string(),
+                include_str!("../acp_test_data/openai_tool_call.txt"),
+            ),
+            (
                 format!(r#""content":"{FAKE_CODE}""#),
                 include_str!("../acp_test_data/openai_tool_result.txt"),
             ),
@@ -887,6 +903,7 @@ async fn run_mode_set_impl<C: Connection>(via: SetModeVia) {
         .await
         .unwrap();
     assert_eq!(output.tool_status.unwrap(), ToolCallStatus::Failed);
+    assert_eq!(output.text, "The tool call was declined. I will not retry it.");
     assert_notifications(
         &session_b.notifications(),
         &[
@@ -898,7 +915,6 @@ async fn run_mode_set_impl<C: Connection>(via: SetModeVia) {
     );
 
     // Auto mode ignores Cancel -- tool succeeds without permission prompt
-    conn.reset_openai();
     expected_session_id.set(&session_a.session_id().0);
     let output = session_a
         .prompt(prompt, PermissionDecision::Cancel)

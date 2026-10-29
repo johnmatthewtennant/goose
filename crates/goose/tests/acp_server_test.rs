@@ -1233,6 +1233,273 @@ impl Drop for AgentLoopOverride {
     }
 }
 
+fn responses_sse(events: Vec<serde_json::Value>) -> String {
+    events
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect()
+}
+
+fn capacity_response(status: &str, output: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "id": "resp_capacity", "object": "response", "created_at": 1,
+        "status": status, "model": "gpt-5.2", "output": output,
+        "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+    })
+}
+
+async fn assert_responses_prompt_outcome(
+    state_machine: bool,
+    scenario: &str,
+    databricks_v2: bool,
+) {
+    use serde_json::json;
+    use wiremock::ResponseTemplate;
+
+    let _agent_loop = AgentLoopOverride::new(state_machine);
+    let overload = json!({
+        "type": "service_unavailable_error", "code": "server_is_overloaded",
+        "message": "Our servers are currently overloaded. Please try again later.", "param": null
+    });
+    let created = json!({"type": "response.created", "sequence_number": 1,
+        "response": capacity_response("in_progress", json!([]))});
+    let tool_response = responses_sse(vec![
+        created.clone(),
+        json!({
+            "type": "response.completed", "sequence_number": 2,
+            "response": capacity_response("completed", json!([{
+                "type": "function_call", "call_id": "call_capacity",
+                "name": "mcp-fixture__get_code", "arguments": "{}"
+            }]))
+        }),
+    ]);
+    let events = match scenario {
+        "normal" => vec![
+            created.clone(),
+            json!({
+                "type": "response.completed", "sequence_number": 2,
+                "response": capacity_response("completed", json!([{
+                    "type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Finished successfully."}]
+                }]))
+            }),
+        ],
+        "http_503" => vec![],
+        "untyped_overload" => vec![
+            created.clone(),
+            json!({"error": overload, "sequence_number": 2}),
+        ],
+        "nested_typed_overload" => vec![
+            created.clone(),
+            json!({"type": "error", "error": overload, "sequence_number": 2}),
+        ],
+        "typed_overload" => vec![
+            created.clone(),
+            json!({
+                "type": "error", "code": "server_is_overloaded",
+                "message": "Our servers are currently overloaded. Please try again later.",
+                "param": null, "sequence_number": 2
+            }),
+        ],
+        "eof" => vec![created.clone()],
+        "partial_text_eof" => vec![
+            created.clone(),
+            json!({
+                "type": "response.output_text.delta", "sequence_number": 2,
+                "item_id": "msg_capacity", "output_index": 0, "content_index": 0,
+                "delta": "Working on it"
+            }),
+        ],
+        _ => panic!("unknown scenario: {scenario}"),
+    };
+    let final_response = if scenario == "http_503" {
+        ResponseTemplate::new(503).set_body_json(json!({"error": overload}))
+    } else {
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string(responses_sse(events))
+    };
+    let mcp = McpFixture::new().await;
+    let openai = OpenAiFixture::responses_after_tool(tool_response, final_response).await;
+    let provider_factory: Option<goose::acp::server::AcpProviderFactory> = if databricks_v2 {
+        let host = openai.uri().to_string();
+        Some(std::sync::Arc::new(move |_, _, _, _| {
+            let host = host.clone();
+            Box::pin(async move {
+                let provider = goose_providers::databricks_v2::DatabricksV2Provider::new(
+                    host,
+                    goose_providers::databricks_auth::DatabricksAuth::Token("test-key".into()),
+                    goose_providers::retry::RetryConfig {
+                        initial_interval_ms: 1,
+                        max_interval_ms: 1,
+                        ..Default::default()
+                    },
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )?;
+                Ok(std::sync::Arc::new(provider) as std::sync::Arc<dyn goose::providers::base::Provider>)
+            })
+        }))
+    } else {
+        None
+    };
+    let mut conn = <AcpServerConnection as Connection>::new(
+        TestConnectionConfig {
+            provider_factory,
+            current_model: "gpt-5.2".to_string(),
+            mcp_servers: vec![McpServer::Http(McpServerHttp::new("mcp-fixture", &mcp.url))],
+            ..Default::default()
+        },
+        openai,
+    )
+    .await;
+    let SessionData { mut session, .. } = conn.new_session().await.unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        session.prompt(
+            "Use get_code, then report completion.",
+            PermissionDecision::Cancel,
+        ),
+    )
+    .await
+    .expect("ACP prompt must terminate, even after a provider failure");
+    if scenario == "normal" {
+        assert_eq!(result.unwrap().text, "Finished successfully.");
+    } else {
+        let error =
+            result.expect_err("provider failure must reject the ACP prompt, not return EndTurn");
+        let error = error
+            .downcast::<agent_client_protocol::Error>()
+            .expect("prompt rejection must be an ACP protocol error");
+        assert_eq!(error.code, ErrorCode::InternalError);
+        let detail = serde_json::to_string(&error).unwrap();
+        if scenario.contains("overload") {
+            assert!(detail.contains("server_is_overloaded"), "{error:?}");
+        } else if scenario == "http_503" {
+            assert!(detail.contains("Our servers are currently overloaded"), "{error:?}");
+        }
+        let stored = SessionManager::new(conn.data_root())
+            .get_session(&session.session_id().0, true)
+            .await
+            .unwrap();
+        let conversation = stored.conversation.unwrap();
+        assert!(conversation.messages().iter().any(|message| message.error_kind().is_some()), "the error must be persisted before ACP rejects the prompt");
+        if scenario == "partial_text_eof" {
+            assert!(conversation.messages().iter().any(|message| message.as_concat_text().contains("Working on it")), "partial output must survive the error");
+        }
+    }
+    assert_eq!(
+        session.notifications().iter().filter(|notification| matches!(
+            notification,
+            common_tests::fixtures::Notification::ToolCallStatus(
+                agent_client_protocol::schema::v1::ToolCallStatus::Completed
+            )
+        )).count(),
+        1,
+        "the MCP tool must complete exactly once despite provider retries"
+    );
+    let stored = SessionManager::new(conn.data_root())
+        .get_session(&session.session_id().0, true)
+        .await
+        .unwrap();
+    let conversation = stored.conversation.unwrap();
+    assert_eq!(
+        conversation.messages().iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|content| content.as_tool_response_text())
+            .filter(|text| text.contains(FAKE_CODE))
+            .count(),
+        1,
+        "the real MCP result must be persisted exactly once"
+    );
+}
+
+macro_rules! responses_prompt_tests {
+    ($legacy:ident, $state_machine:ident, $scenario:literal) => {
+        #[test]
+        fn $legacy() {
+            run_test(async { assert_responses_prompt_outcome(false, $scenario, false).await });
+        }
+        #[test]
+        fn $state_machine() {
+            run_test(async { assert_responses_prompt_outcome(true, $scenario, false).await });
+        }
+    };
+}
+
+responses_prompt_tests!(
+    test_capacity_normal_legacy,
+    test_capacity_normal_state_machine,
+    "normal"
+);
+responses_prompt_tests!(
+    test_capacity_http_503_legacy,
+    test_capacity_http_503_state_machine,
+    "http_503"
+);
+responses_prompt_tests!(
+    test_capacity_untyped_overload_legacy,
+    test_capacity_untyped_overload_state_machine,
+    "untyped_overload"
+);
+responses_prompt_tests!(
+    test_capacity_nested_typed_overload_legacy,
+    test_capacity_nested_typed_overload_state_machine,
+    "nested_typed_overload"
+);
+responses_prompt_tests!(
+    test_capacity_typed_overload_legacy,
+    test_capacity_typed_overload_state_machine,
+    "typed_overload"
+);
+responses_prompt_tests!(
+    test_capacity_eof_legacy,
+    test_capacity_eof_state_machine,
+    "eof"
+);
+responses_prompt_tests!(
+    test_capacity_partial_text_eof_legacy,
+    test_capacity_partial_text_eof_state_machine,
+    "partial_text_eof"
+);
+
+macro_rules! databricks_v2_responses_prompt_tests {
+    ($legacy:ident, $state_machine:ident, $scenario:literal) => {
+        #[test]
+        fn $legacy() {
+            run_test(async { assert_responses_prompt_outcome(false, $scenario, true).await });
+        }
+        #[test]
+        fn $state_machine() {
+            run_test(async { assert_responses_prompt_outcome(true, $scenario, true).await });
+        }
+    };
+}
+
+databricks_v2_responses_prompt_tests!(
+    test_capacity_databricks_v2_normal_legacy,
+    test_capacity_databricks_v2_normal_state_machine,
+    "normal"
+);
+databricks_v2_responses_prompt_tests!(
+    test_capacity_databricks_v2_http_503_legacy,
+    test_capacity_databricks_v2_http_503_state_machine,
+    "http_503"
+);
+databricks_v2_responses_prompt_tests!(
+    test_capacity_databricks_v2_untyped_overload_legacy,
+    test_capacity_databricks_v2_untyped_overload_state_machine,
+    "untyped_overload"
+);
+databricks_v2_responses_prompt_tests!(
+    test_capacity_databricks_v2_partial_text_eof_legacy,
+    test_capacity_databricks_v2_partial_text_eof_state_machine,
+    "partial_text_eof"
+);
+
 /// Two provider calls separated by a tool call. The canned responses report 2469
 /// and then 2631 total tokens, so 2469 can only arrive in an update sent while
 /// the prompt is still running.

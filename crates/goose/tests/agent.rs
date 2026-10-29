@@ -4028,6 +4028,112 @@ mod tests {
             Ok(())
         }
 
+        #[tokio::test]
+        async fn test_legacy_recipe_retry_after_provider_operational_error() -> Result<()> {
+            use goose::agents::types::{RetryConfig, SuccessCheck};
+
+            struct FailThenSucceedProvider {
+                call_count: AtomicUsize,
+                network_error: bool,
+            }
+
+            #[async_trait]
+            impl Provider for FailThenSucceedProvider {
+                async fn stream(
+                    &self,
+                    _model_config: &ModelConfig,
+                    _system_prompt: &str,
+                    _messages: &[Message],
+                    _tools: &[Tool],
+                ) -> Result<MessageStream, ProviderError> {
+                    // No internal retries: only the recipe can make the second call.
+                    if self.call_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return Err(if self.network_error {
+                            ProviderError::NetworkError("connection reset".to_string())
+                        } else {
+                            ProviderError::ServerError("service unavailable".to_string())
+                        });
+                    }
+                    Ok(stream_from_single_message(
+                        Message::assistant().with_text("Recipe recovered."),
+                        usage(),
+                    ))
+                }
+
+                fn get_name(&self) -> &str {
+                    "fail-then-succeed-mock"
+                }
+            }
+
+            let _guard = env_lock::lock_env([
+                ("GOOSE_STATE_MACHINE", Some("0")),
+                ("GOOSE_DISABLE_SESSION_NAMING", Some("true")),
+            ]);
+            for network_error in [false, true] {
+                let temp_dir = tempfile::tempdir()?;
+                let marker = temp_dir.path().join("on-failure-ran");
+                let agent = Agent::new();
+                let session = agent
+                    .config
+                    .session_manager
+                    .create_session(
+                        PathBuf::default(),
+                        "recipe-operational-error".to_string(),
+                        SessionType::Hidden,
+                        GooseMode::default(),
+                    )
+                    .await?;
+                let provider = Arc::new(FailThenSucceedProvider {
+                    call_count: AtomicUsize::new(0),
+                    network_error,
+                });
+                agent
+                    .update_provider(
+                        provider.clone(),
+                        ModelConfig::new("mock-model"),
+                        &session.id,
+                    )
+                    .await?;
+                let session_config = SessionConfig {
+                    id: session.id,
+                    schedule_id: None,
+                    max_turns: Some(3),
+                    retry_config: Some(RetryConfig {
+                        max_retries: 1,
+                        checks: vec![SuccessCheck::Shell {
+                            command: format!("test -f '{}'", marker.display()),
+                        }],
+                        on_failure: Some(format!("touch '{}'", marker.display())),
+                        timeout_seconds: Some(30),
+                        on_failure_timeout_seconds: Some(30),
+                    }),
+                };
+                let reply_stream = agent
+                    .reply(
+                        Message::user().with_text("Hi"),
+                        session_config,
+                        goose::agents::state_machine::enabled(),
+                        None,
+                    )
+                    .await?;
+                tokio::pin!(reply_stream);
+                let mut messages = Vec::new();
+                while let Some(event) = reply_stream.next().await {
+                    if let AgentEvent::Message(message) = event? {
+                        messages.push(message);
+                    }
+                }
+
+                assert!(
+                    marker.exists(),
+                    "recipe on_failure must run after an operational error (network={network_error})"
+                );
+                assert_eq!(provider.call_count.load(Ordering::SeqCst), 2);
+                assert!(concat_text(&messages).contains("Recipe recovered."));
+            }
+            Ok(())
+        }
+
         /// When a recipe exhausts its retries on empty turns, the max-attempts
         /// failure message must be surfaced and persisted — not swallowed into a
         /// silent stop.

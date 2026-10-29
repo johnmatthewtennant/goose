@@ -2847,6 +2847,7 @@ impl Agent {
                 let mut did_recovery_compact_this_iteration = false;
                 let mut exit_chat = false;
                 let mut provider_errored = false;
+                let mut pending_provider_error = None;
                 let mut provider_produced_content = false;
                 let mut provider_reached_output_token_limit = false;
                 let mut pending_final_output: Option<String> = None;
@@ -3353,28 +3354,12 @@ impl Agent {
                             yield AgentEvent::Message(message);
                             break;
                         }
-                        Err(ref provider_err @ ProviderError::NetworkError(_)) => {
-                            provider_errored = true;
-                            #[cfg(feature = "telemetry")]
-                            crate::posthog::emit_error(provider_err.telemetry_type(), &provider_err.to_string());
-                            error!("Error: {}", provider_err);
-                            yield AgentEvent::Message(
-                                Message::assistant().with_text(
-                                    format!("{provider_err}\n\nPlease resend your message to try again.")
-                                )
-                            );
-                            break;
-                        }
                         Err(ref provider_err) => {
                             provider_errored = true;
                             #[cfg(feature = "telemetry")]
                             crate::posthog::emit_error(provider_err.telemetry_type(), &provider_err.to_string());
                             error!("Error: {}", provider_err);
-                            yield AgentEvent::Message(
-                                Message::assistant().with_text(
-                                    format!("Ran into this error: {provider_err}.\n\nPlease retry if you think this is a transient or recoverable error.")
-                                )
-                            );
+                            pending_provider_error = Some(Message::from_provider_error(provider_err));
                             break;
                         }
                     }
@@ -3406,7 +3391,20 @@ impl Agent {
                     empty_turn_retries = 0;
                 }
 
-                if no_tools_called && !exit_chat {
+                if let Some(provider_error) = pending_provider_error {
+                    match self.handle_retry_logic(&mut conversation, &session_config, &initial_messages).await {
+                        Ok(RetryResult::Retried) => {
+                            messages_to_add = Conversation::default();
+                            session_manager.replace_conversation(&session_config.id, &conversation).await?;
+                            yield AgentEvent::HistoryReplaced(conversation.clone());
+                        }
+                        _ => {
+                            let message = push_message_with_id(&mut messages_to_add, provider_error);
+                            yield AgentEvent::Message(message);
+                            exit_chat = true;
+                        }
+                    }
+                } else if no_tools_called && !exit_chat {
                     // Lock, extract state, drop guard before branching — handle_retry_logic
                     // also locks final_output_tool and tokio::sync::Mutex is not reentrant.
                     let final_output = {

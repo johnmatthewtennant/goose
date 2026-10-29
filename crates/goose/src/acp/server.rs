@@ -1682,6 +1682,11 @@ fn prompt_error_from_message_content(
                     .data(serde_json::Value::Object(data)),
             )
         }
+        MessageContent::Error(error)
+            if error.kind == crate::conversation::message::MessageErrorKind::Other =>
+        {
+            Some(agent_client_protocol::Error::internal_error().data(error.message.clone()))
+        }
         _ => None,
     }
 }
@@ -2134,6 +2139,7 @@ impl GooseAcpAgent {
         let mut tool_requests = HashMap::new();
         let mut chain_tracker = ToolChainTracker::default();
         let mut context_limit = None;
+        let mut prompt_error = None;
         let target = SessionAgentTarget {
             agent: agent.clone(),
             session_id: session_id.to_string(),
@@ -2160,7 +2166,10 @@ impl GooseAcpAgent {
                     populate_output_token_limit_content(&mut message);
                     for content_item in &message.content {
                         if let Some(error) = prompt_error_from_message_content(content_item) {
-                            return Err(error);
+                            // Drain the turn so both loops persist partial output and error
+                            // before the client can retry or reload the conversation.
+                            prompt_error.get_or_insert(error);
+                            continue;
                         }
 
                         if let MessageContent::ToolRequest(tool_request) = content_item {
@@ -2247,6 +2256,10 @@ impl GooseAcpAgent {
             if let Some(chain) = chain_tracker.close_current_chain() {
                 self.spawn_ready_chain_summary(chain, agent, acp_session_id, cx);
             }
+        }
+
+        if let Some(error) = prompt_error {
+            return Err(error);
         }
 
         Ok(AgentStreamOutcome {
