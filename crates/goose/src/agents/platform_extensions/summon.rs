@@ -1,33 +1,34 @@
+use crate::agents::AgentConfig;
 use crate::agents::extension::PlatformExtensionContext;
 use crate::agents::mcp_client::{Error, McpClientTrait};
-use crate::agents::subagent_handler::{run_subagent_task, OnMessageCallback, SubagentRunParams};
-use crate::agents::subagent_task_config::{TaskConfig, DEFAULT_SUBAGENT_MAX_TURNS};
+use crate::agents::subagent_handler::{OnMessageCallback, SubagentRunParams, run_subagent_task};
+use crate::agents::subagent_task_config::{DEFAULT_SUBAGENT_MAX_TURNS, TaskConfig};
 use crate::agents::tool_execution::ToolCallContext;
-use crate::agents::AgentConfig;
 use crate::config::paths::Paths;
 use crate::config::{Config, GooseMode};
 use crate::providers;
 use crate::recipe::build_recipe::build_recipe_from_template;
 use crate::recipe::local_recipes::load_local_recipe_file;
-use crate::recipe::{Recipe, RecipeParameter, Settings, RECIPE_FILE_EXTENSIONS};
-use crate::session::extension_data::EnabledExtensionsState;
+use crate::recipe::{RECIPE_FILE_EXTENSIONS, Recipe, RecipeParameter, Settings};
 use crate::session::SessionType;
+use crate::session::extension_data::EnabledExtensionsState;
 use crate::sources::parse_frontmatter;
 use crate::utils::safe_truncate;
 use anyhow::Result;
 use async_trait::async_trait;
 use goose_sdk_types::custom_requests::{SourceEntry, SourceType};
 use rmcp::model::{
-    CallToolResult, Content, Implementation, InitializeResult, JsonObject, ListToolsResult, Meta,
-    ServerCapabilities, ServerNotification, Tool,
+    CallToolResult, Content, Implementation, InitializeResult, JsonObject, ListToolsResult,
+    LoggingLevel, LoggingMessageNotificationParam, Meta, Notification, ServerCapabilities,
+    ServerNotification, Tool,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -79,6 +80,69 @@ pub struct CompletedTask {
     pub result: Result<String, String>,
     pub turns_taken: u32,
     pub duration: Duration,
+    pub status: TaskCompletionStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskCompletionStatus {
+    Completed,
+    ActionLimitReached,
+}
+
+const ACTION_LIMIT_MESSAGE: &str =
+    "I've reached the maximum number of actions I can do without user input";
+const SUBAGENT_TASK_STATUS_TYPE: &str = "subagent_task_status";
+
+fn completion_status_for_output(output: &str) -> TaskCompletionStatus {
+    if output.contains(ACTION_LIMIT_MESSAGE) {
+        TaskCompletionStatus::ActionLimitReached
+    } else {
+        TaskCompletionStatus::Completed
+    }
+}
+
+fn task_status_label(
+    status: TaskCompletionStatus,
+    result: &Result<String, String>,
+) -> &'static str {
+    match (status, result) {
+        (_, Err(_)) => "✗ Failed",
+        (TaskCompletionStatus::ActionLimitReached, Ok(_)) => "⚠ Action limit reached",
+        (TaskCompletionStatus::Completed, Ok(_)) => "✓ Completed",
+    }
+}
+
+fn task_status_slug(status: TaskCompletionStatus, result: &Result<String, String>) -> &'static str {
+    match (status, result) {
+        (_, Err(_)) => "failed",
+        (TaskCompletionStatus::ActionLimitReached, Ok(_)) => "action_limit_reached",
+        (TaskCompletionStatus::Completed, Ok(_)) => "completed",
+    }
+}
+
+fn create_task_status_notification(
+    task_id: &str,
+    description: &str,
+    status: TaskCompletionStatus,
+    result: &Result<String, String>,
+    turns_taken: u32,
+    duration: Duration,
+) -> ServerNotification {
+    ServerNotification::LoggingMessageNotification(Notification::new(
+        LoggingMessageNotificationParam::new(
+            LoggingLevel::Info,
+            serde_json::json!({
+                "type": SUBAGENT_TASK_STATUS_TYPE,
+                "subagent_id": task_id,
+                "task": description,
+                "status": task_status_slug(status, result),
+                "status_label": task_status_label(status, result),
+                "turns": turns_taken,
+                "duration_ms": duration.as_millis(),
+            }),
+        )
+        .with_logger(format!("subagent:{task_id}")),
+    ))
 }
 
 #[derive(Debug, Deserialize)]
@@ -799,11 +863,7 @@ impl SummonClient {
         let mut completed = self.completed_tasks.lock().await;
 
         if let Some(task) = completed.remove(task_id) {
-            let status = if task.result.is_ok() {
-                "✓ Completed"
-            } else {
-                "✗ Failed"
-            };
+            let status = task_status_label(task.status, &task.result);
             let output = match task.result {
                 Ok(output) => output,
                 Err(error) => format!("Error: {}", error),
@@ -886,20 +946,24 @@ impl SummonClient {
 
             tokio::select! {
                 result = &mut task.handle => {
-                    let output = match result {
-                        Ok(Ok(s)) => s,
-                        Ok(Err(e)) => format!("Error: {}", e),
-                        Err(e) => format!("Task panicked: {}", e),
+                    let (output, status) = match result {
+                        Ok(Ok(s)) => {
+                            let status = completion_status_for_output(&s);
+                            (s, task_status_label(status, &Ok(String::new())))
+                        }
+                        Ok(Err(e)) => (format!("Error: {}", e), "✗ Failed"),
+                        Err(e) => (format!("Task panicked: {}", e), "✗ Failed"),
                     };
 
                     return Ok(vec![Content::text(format!(
                         "# Background Task Result: {}\n\n\
                          **Task:** {}\n\
-                         **Status:** ✓ Completed\n\
+                         **Status:** {}\n\
                          **Duration:** {} ({} turns)\n\n\
                          ## Output\n\n{}",
                         task_id,
                         task.description,
+                        status,
                         round_duration(task.started_at.elapsed()),
                         task.turns.load(Ordering::Relaxed),
                         output
@@ -1212,7 +1276,7 @@ impl SummonClient {
                 return Err(format!(
                     "Source '{}' has kind '{}' which cannot be delegated from summon",
                     source_name, source.source_type
-                ))
+                ));
             }
         };
 
@@ -1513,20 +1577,41 @@ impl SummonClient {
             let duration = task.started_at.elapsed();
             let turns_taken = task.turns.load(Ordering::Relaxed);
 
-            let result = match task.handle.await {
+            let (result, status) = match task.handle.await {
                 Ok(Ok(output)) => {
-                    info!("Background task {} completed successfully", id);
-                    Ok(output)
+                    let status = completion_status_for_output(&output);
+                    match status {
+                        TaskCompletionStatus::Completed => {
+                            info!("Background task {} completed successfully", id);
+                        }
+                        TaskCompletionStatus::ActionLimitReached => {
+                            warn!("Background task {} reached its action limit", id);
+                        }
+                    }
+                    (Ok(output), status)
                 }
                 Ok(Err(e)) => {
                     warn!("Background task {} failed: {}", id, e);
-                    Err(e.to_string())
+                    (Err(e.to_string()), TaskCompletionStatus::Completed)
                 }
                 Err(e) => {
                     warn!("Background task {} panicked: {}", id, e);
-                    Err(format!("Task panicked: {}", e))
+                    (
+                        Err(format!("Task panicked: {}", e)),
+                        TaskCompletionStatus::Completed,
+                    )
                 }
             };
+
+            let notification = create_task_status_notification(
+                &id,
+                &task.description,
+                status,
+                &result,
+                turns_taken,
+                duration,
+            );
+            self.publish_notification(notification).await;
 
             completed.insert(
                 id.clone(),
@@ -1536,9 +1621,19 @@ impl SummonClient {
                     result,
                     turns_taken,
                     duration,
+                    status,
                 },
             );
         }
+    }
+
+    async fn publish_notification(&self, notification: ServerNotification) {
+        let mut subs = self.notification_subscribers.lock().await;
+        subs.retain(|tx| match tx.try_send(notification.clone()) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => true,
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        });
     }
 
     fn get_task_description(params: &DelegateParams) -> String {
@@ -1790,10 +1885,10 @@ impl McpClientTrait for SummonClient {
         sorted_completed.sort_by_key(|t| &t.id);
 
         for task in sorted_completed {
-            let status = if task.result.is_ok() {
-                "completed"
-            } else {
-                "failed"
+            let status = match (task.status, &task.result) {
+                (_, Err(_)) => "failed",
+                (TaskCompletionStatus::ActionLimitReached, Ok(_)) => "action limit reached",
+                (TaskCompletionStatus::Completed, Ok(_)) => "completed",
             };
             lines.push(format!(
                 "• {}: \"{}\" - {} in {} ({} turns) - use load(\"{}\") to get result",
@@ -2387,6 +2482,7 @@ You review code."#;
                     result: Ok("Task completed successfully with output".to_string()),
                     turns_taken: 5,
                     duration: Duration::from_secs(60),
+                    status: TaskCompletionStatus::Completed,
                 },
             );
             completed.insert(
@@ -2397,6 +2493,7 @@ You review code."#;
                     result: Err("Something went wrong".to_string()),
                     turns_taken: 3,
                     duration: Duration::from_secs(30),
+                    status: TaskCompletionStatus::Completed,
                 },
             );
         }
@@ -2428,11 +2525,13 @@ You review code."#;
         assert!(text.contains("5 turns"));
         assert!(text.contains("Task completed successfully with output"));
 
-        assert!(!client
-            .completed_tasks
-            .lock()
-            .await
-            .contains_key("20260204_2"));
+        assert!(
+            !client
+                .completed_tasks
+                .lock()
+                .await
+                .contains_key("20260204_2")
+        );
 
         let result = client
             .handle_load_task_result("20260204_3", false)
@@ -2441,6 +2540,35 @@ You review code."#;
         let text = extract_text(&result[0]);
         assert!(text.contains("✗ Failed"));
         assert!(text.contains("Error: Something went wrong"));
+
+        {
+            let mut completed = client.completed_tasks.lock().await;
+            completed.insert(
+                "20260204_4".to_string(),
+                CompletedTask {
+                    id: "20260204_4".to_string(),
+                    description: "Action-limited task".to_string(),
+                    result: Ok(format!(
+                        "{}? Would you like me to continue?",
+                        ACTION_LIMIT_MESSAGE
+                    )),
+                    turns_taken: 28,
+                    duration: Duration::from_secs(568),
+                    status: TaskCompletionStatus::ActionLimitReached,
+                },
+            );
+        }
+
+        let moim = client.get_moim("test").await.unwrap();
+        assert!(moim.contains("action limit reached"));
+
+        let result = client
+            .handle_load_task_result("20260204_4", false)
+            .await
+            .unwrap();
+        let text = extract_text(&result[0]);
+        assert!(text.contains("⚠ Action limit reached"));
+        assert!(!text.contains("**Status:** ✓ Completed"));
 
         let result = client.handle_load_task_result("20260204_3", false).await;
         assert!(result.is_err());
@@ -2484,10 +2612,12 @@ You review code."#;
         assert!(text.contains("20260204_1"));
         assert!(text.contains("Cancellable task"));
         assert!(token.is_cancelled());
-        assert!(!client
-            .background_tasks
-            .lock()
-            .await
-            .contains_key("20260204_1"));
+        assert!(
+            !client
+                .background_tasks
+                .lock()
+                .await
+                .contains_key("20260204_1")
+        );
     }
 }
