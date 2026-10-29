@@ -1695,23 +1695,8 @@ fn prompt_error_from_conversation(
     conversation: &Conversation,
 ) -> Option<agent_client_protocol::Error> {
     conversation
-        .messages()
-        .iter()
-        .rev()
-        .take_while(|message| message.role != Role::User)
-        .find(|message| {
-            message.role == Role::Assistant
-                && message
-                    .content
-                    .iter()
-                    .any(|content| !matches!(content, MessageContent::SystemNotification(_)))
-        })
-        .and_then(|message| {
-            message
-                .content
-                .iter()
-                .find_map(prompt_error_from_message_content)
-        })
+        .terminal_error()
+        .and_then(|error| prompt_error_from_message_content(&MessageContent::Error(error.clone())))
 }
 
 fn credits_exhausted_prompt_error(

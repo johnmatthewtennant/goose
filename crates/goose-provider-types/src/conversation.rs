@@ -43,6 +43,27 @@ impl Conversation {
         &self.0
     }
 
+    /// The typed failure of the current turn after its stream has drained.
+    /// Recovery replaces earlier errors; notification-only notices do not.
+    pub fn terminal_error(&self) -> Option<&message::ErrorContent> {
+        self.0
+            .iter()
+            .rev()
+            .take_while(|message| message.role != Role::User)
+            .find(|message| {
+                message.role == Role::Assistant
+                    && message.content.iter().any(|content| {
+                        !matches!(content, MessageContentBlock::SystemNotification(_))
+                    })
+            })
+            .and_then(|message| {
+                message.content.iter().find_map(|content| match content {
+                    MessageContentBlock::Error(error) => Some(error),
+                    _ => None,
+                })
+            })
+    }
+
     pub fn messages_mut(&mut self) -> &mut Vec<Message> {
         &mut self.0
     }
@@ -2011,6 +2032,44 @@ mod tests {
                 assert_eq!(c.text, "and now text");
             }
             other => panic!("unexpected content shape: {:?}", other),
+        }
+    }
+}
+
+#[cfg(test)]
+mod terminal_outcome_tests {
+    use super::*;
+    use message::{MessageErrorKind, SystemNotificationType};
+
+    #[test]
+    fn terminal_error_uses_current_final_outcome_not_notices_or_prior_failures() {
+        for kind in [
+            MessageErrorKind::Other,
+            MessageErrorKind::Authentication,
+            MessageErrorKind::CreditsExhausted,
+            MessageErrorKind::ContextLengthExceeded,
+        ] {
+            let mut conversation = Conversation::new_unvalidated([
+                Message::user().with_text("prompt"),
+                Message::assistant().with_error(kind, "failure"),
+            ]);
+            assert_eq!(
+                conversation.terminal_error().map(|error| error.kind),
+                Some(kind)
+            );
+            conversation.push(Message::assistant().with_system_notification(
+                SystemNotificationType::InlineMessage,
+                "Stop hook limit reached",
+            ));
+            assert_eq!(
+                conversation.terminal_error().map(|error| error.kind),
+                Some(kind)
+            );
+            conversation.push(Message::assistant().with_text("recovered"));
+            assert!(conversation.terminal_error().is_none());
+            conversation.push(Message::assistant().with_error(kind, "failed again"));
+            conversation.push(Message::user().with_text("next turn"));
+            assert!(conversation.terminal_error().is_none());
         }
     }
 }
