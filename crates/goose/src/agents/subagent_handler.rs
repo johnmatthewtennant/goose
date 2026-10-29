@@ -172,13 +172,8 @@ pub(crate) fn saved_outcome(conversation: &Conversation) -> Option<SubagentOutco
             conversation.messages(),
         )));
     }
-    let messages = conversation.messages();
-    // Schema outputs from an older request cannot complete a resumed turn.
-    let start = messages
-        .iter()
-        .rposition(|message| message.role == Role::User && !message.is_tool_response())
-        .unwrap_or(0);
-    let messages = &messages[start..];
+    // Match recipe collection: hidden feedback belongs to the original visible request.
+    let messages = goose_agent::operation::messages_since_kickoff(conversation).ok()?;
     if messages
         .iter()
         .rev()
@@ -577,6 +572,39 @@ mod outcome_tests {
         assert!(matches!(
             classify_outcome(Some(&saved), false, Ok(())),
             SubagentOutcome::Completed(_)
+        ));
+    }
+
+    #[test]
+    fn hidden_feedback_preserves_recipe_output_but_visible_request_resets_it() {
+        let mut saved = successful();
+        let expected = saved_outcome(&saved).expect("accepted recipe output");
+        saved.push(
+            Message::user()
+                .with_text("Stop hook `policy` blocked ending this turn: address feedback")
+                .with_visibility(false, true),
+        );
+        saved.push(Message::assistant().with_text("addressed feedback"));
+        assert_eq!(saved_outcome(&saved), Some(expected.clone()));
+        assert_eq!(classify_outcome(Some(&saved), false, Ok(())), expected);
+        assert_eq!(
+            classify_outcome(Some(&saved), true, Ok(())),
+            SubagentOutcome::Cancelled
+        );
+        assert!(matches!(
+            classify_outcome(Some(&saved), false, Err(anyhow!("stream disconnected"))),
+            SubagentOutcome::Failed(reason) if reason.contains("stream disconnected")
+        ));
+
+        saved.push(Message::user().with_text("new visible request"));
+        saved.push(Message::assistant().with_text("not finished yet"));
+        assert!(
+            saved_outcome(&saved).is_none(),
+            "previous output must not complete a new visible request"
+        );
+        assert!(matches!(
+            classify_outcome(Some(&saved), false, Ok(())),
+            SubagentOutcome::Failed(_)
         ));
     }
 
