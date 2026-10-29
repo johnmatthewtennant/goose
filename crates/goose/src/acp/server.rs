@@ -12,7 +12,7 @@ use crate::agents::extension::{Envs, PLATFORM_EXTENSIONS};
 use crate::agents::extension_manager::ClientContext;
 use crate::agents::mcp_client::GooseMcpHostInfo;
 use crate::agents::state_machine::{
-    has_unapplied_tool_confirmation_response, pending_tool_confirmations, turn_failure,
+    has_unapplied_tool_confirmation_response, pending_tool_confirmations,
 };
 use crate::agents::{
     Attachment, ExtensionConfig, ExtensionLoadResult, GoosePlatform, SessionConfig,
@@ -1597,6 +1597,14 @@ fn prompt_error_from_message_content(
     }
 }
 
+fn prompt_error_from_conversation(
+    conversation: &Conversation,
+) -> Option<agent_client_protocol::Error> {
+    conversation
+        .terminal_error()
+        .and_then(|error| prompt_error_from_message_content(&MessageContent::Error(error.clone())))
+}
+
 fn turn_failed_data() -> serde_json::Value {
     serde_json::json!({ "reason": crate::acp::TURN_FAILED_REASON })
 }
@@ -2033,7 +2041,6 @@ impl AcpConnection {
         let mut output_token_limit_reached = false;
         let mut tool_requests = HashMap::new();
         let mut chain_tracker = ToolChainTracker::default();
-        let mut last_message_was_error = false;
         let mut context_limit = None;
         let target = SessionTarget {
             session_id: session_id.to_string(),
@@ -2055,7 +2062,6 @@ impl AcpConnection {
                     }
 
                     populate_output_token_limit_content(&mut message);
-                    last_message_was_error = message.error_kind().is_some();
                     for content_item in &message.content {
                         if let MessageContent::ToolRequest(tool_request) = content_item {
                             tool_requests.insert(tool_request.id.clone(), tool_request.clone());
@@ -2146,26 +2152,18 @@ impl AcpConnection {
 
         let was_cancelled = cancel_token.is_cancelled();
         if !was_cancelled {
-            if last_message_was_error {
-                let session = self
-                    .services
-                    .session_manager
-                    .get_session(session_id, true)
-                    .await
-                    .internal_err_ctx("Failed to load session")?;
-                if let Some(error) = session
-                    .conversation
-                    .as_ref()
-                    .and_then(turn_failure)
-                    .and_then(|message| {
-                        message
-                            .content
-                            .iter()
-                            .find_map(prompt_error_from_message_content)
-                    })
-                {
-                    return Err(error);
-                }
+            let session = self
+                .services
+                .session_manager
+                .get_session(session_id, true)
+                .await
+                .internal_err_ctx("Failed to load session")?;
+            if let Some(error) = session
+                .conversation
+                .as_ref()
+                .and_then(prompt_error_from_conversation)
+            {
+                return Err(error);
             }
             if let Some(chain) = chain_tracker.close_current_chain() {
                 self.spawn_ready_chain_summary(chain, acp_session_id, cx);
@@ -3371,6 +3369,28 @@ print(\"hello, world\")
                 }
             })
         );
+    }
+
+    #[test]
+    fn saved_prompt_error_ignores_notice_only_tail_and_allows_recovery() {
+        use crate::conversation::message::MessageErrorKind;
+        let mut conversation = Conversation::new_unvalidated([
+            Message::user().with_text("task"),
+            Message::assistant().with_error(MessageErrorKind::Other, "provider exhausted"),
+            Message::assistant()
+                .with_system_notification(SystemNotificationType::InlineMessage, "Stop cap"),
+        ]);
+        let error =
+            prompt_error_from_conversation(&conversation).expect("notice must not hide failure");
+        assert_eq!(
+            error.data.unwrap()["reason"],
+            crate::acp::TURN_FAILED_REASON
+        );
+        conversation.push(Message::assistant().with_text("recovered"));
+        assert!(prompt_error_from_conversation(&conversation).is_none());
+        conversation.push(Message::assistant().with_error(MessageErrorKind::Other, "failed again"));
+        conversation.push(Message::user().with_text("next turn"));
+        assert!(prompt_error_from_conversation(&conversation).is_none());
     }
 
     #[test]
