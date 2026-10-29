@@ -1,8 +1,7 @@
 use crate::{
     agents::{
-        final_output_tool::FinalOutputTool,
-        state_machine::{trailing_error, MAX_TURNS_MESSAGE},
-        AgentEvent, SessionConfig, StateMachineServices,
+        final_output_tool::FinalOutputTool, state_machine::MAX_TURNS_MESSAGE, AgentEvent,
+        SessionConfig, StateMachineServices,
     },
     conversation::{
         message::{ActionRequiredData, Message, MessageContent},
@@ -155,25 +154,86 @@ impl ForegroundSubagentRunner {
             Ok(subagent) => subagent,
             Err(error) => return SubagentOutcome::Failed(error.to_string()),
         };
-        let messages = subagent.conversation.as_ref().map(Conversation::messages);
-        if let Some(output) =
-            messages.and_then(|messages| FinalOutputTool::successful_output(messages))
-        {
-            return SubagentOutcome::Completed(output);
-        }
-        if stopped {
-            return SubagentOutcome::Cancelled;
-        }
-        if let Err(error) = run_result {
-            return SubagentOutcome::Failed(error.to_string());
-        }
-        if let Some(error) = subagent.conversation.as_ref().and_then(trailing_error) {
-            return SubagentOutcome::Failed(format!("{error:?}"));
-        }
-        SubagentOutcome::Failed(failure_reason(
-            messages.map(Vec::as_slice).unwrap_or_default(),
-        ))
+        classify_outcome(subagent.conversation.as_ref(), stopped, run_result)
     }
+}
+
+pub(crate) fn saved_outcome(conversation: &Conversation) -> Option<SubagentOutcome> {
+    if let Some(error) = conversation.terminal_error() {
+        return Some(SubagentOutcome::Failed(with_progress(
+            &format!("{:?}: {}", error.kind, error.message),
+            conversation.messages(),
+        )));
+    }
+    let messages = conversation.messages();
+    // Schema outputs from an older request cannot complete a resumed turn.
+    let start = messages
+        .iter()
+        .rposition(|message| message.role == Role::User && !message.is_tool_response())
+        .unwrap_or(0);
+    let messages = &messages[start..];
+    if messages
+        .iter()
+        .rev()
+        .find(|message| {
+            message.role == Role::Assistant
+                && message
+                    .content
+                    .iter()
+                    .any(|content| !matches!(content, MessageContent::SystemNotification(_)))
+        })
+        .is_some_and(|message| message.as_concat_text() == MAX_TURNS_MESSAGE)
+    {
+        return Some(SubagentOutcome::Failed(with_progress(
+            "max turns reached",
+            messages,
+        )));
+    }
+    FinalOutputTool::successful_output(messages).map(SubagentOutcome::Completed)
+}
+
+fn classify_outcome(
+    conversation: Option<&Conversation>,
+    stopped: bool,
+    run_result: Result<()>,
+) -> SubagentOutcome {
+    if stopped {
+        return SubagentOutcome::Cancelled;
+    }
+    let messages = conversation
+        .map(Conversation::messages)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if let Err(error) = run_result {
+        return SubagentOutcome::Failed(with_progress(&error.to_string(), messages));
+    }
+    conversation.and_then(saved_outcome).unwrap_or_else(|| {
+        SubagentOutcome::Failed(with_progress(&failure_reason(messages), messages))
+    })
+}
+
+fn with_progress(reason: &str, messages: &[Message]) -> String {
+    let progress = messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|content| match content {
+            MessageContent::Text(text) => Some(text.text.clone()),
+            MessageContent::ToolResponse(response) => {
+                response.tool_result.as_ref().ok().map(|result| {
+                    result
+                        .content
+                        .iter()
+                        .filter_map(|content| content.as_text().map(|text| text.text.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+            }
+            _ => None,
+        })
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{reason}\n\n## Worker progress\n\n{progress}")
 }
 
 fn spawn_run(
@@ -415,5 +475,111 @@ mod tests {
         for (messages, expected) in cases {
             assert_eq!(failure_reason(&messages), expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod outcome_tests {
+    use super::*;
+    use crate::agents::final_output_tool::{FINAL_OUTPUT_SUCCESS_MESSAGE, FINAL_OUTPUT_TOOL_NAME};
+    use crate::conversation::message::{MessageErrorKind, SystemNotificationType};
+    use rmcp::model::{CallToolRequestParams, CallToolResult, ContentBlock};
+
+    fn successful() -> Conversation {
+        Conversation::new_unvalidated([
+            Message::user().with_text("task"),
+            Message::assistant().with_tool_request(
+                "final",
+                Ok(
+                    CallToolRequestParams::new(FINAL_OUTPUT_TOOL_NAME).with_arguments(
+                        serde_json::json!({"summary":"done"})
+                            .as_object()
+                            .unwrap()
+                            .clone(),
+                    ),
+                ),
+            ),
+            Message::user().with_tool_response(
+                "final",
+                Ok(CallToolResult::success(vec![ContentBlock::text(
+                    FINAL_OUTPUT_SUCCESS_MESSAGE,
+                )])),
+            ),
+        ])
+    }
+
+    #[test]
+    fn stream_error_and_cancellation_precede_saved_output() {
+        let saved = successful();
+        assert!(
+            matches!(classify_outcome(Some(&saved), false, Err(anyhow!("stream disconnected"))),
+            SubagentOutcome::Failed(reason) if reason.contains("stream disconnected"))
+        );
+        assert_eq!(
+            classify_outcome(Some(&saved), true, Ok(())),
+            SubagentOutcome::Cancelled
+        );
+    }
+
+    #[test]
+    fn latest_turn_error_and_notice_cannot_be_hidden_by_old_output() {
+        let mut saved = successful();
+        saved.push(Message::user().with_text("continue"));
+        saved.push(Message::assistant().with_error(MessageErrorKind::Other, "provider exhausted"));
+        saved.push(
+            Message::assistant()
+                .with_system_notification(SystemNotificationType::InlineMessage, "Stop cap"),
+        );
+        assert!(
+            matches!(saved_outcome(&saved), Some(SubagentOutcome::Failed(reason)) if reason.contains("provider exhausted"))
+        );
+        saved.push(Message::assistant().with_text("recovered"));
+        assert!(
+            saved_outcome(&saved).is_none(),
+            "historical output cannot complete the latest request"
+        );
+        let recovered = successful();
+        assert!(matches!(
+            saved_outcome(&recovered),
+            Some(SubagentOutcome::Completed(_))
+        ));
+    }
+
+    #[test]
+    fn persisted_recovery_supersedes_operational_error() {
+        let mut saved = Conversation::new_unvalidated([
+            Message::user().with_text("task"),
+            Message::assistant().with_error(MessageErrorKind::Other, "transient failure"),
+        ]);
+        for message in successful().messages().iter().skip(1) {
+            saved.push(message.clone());
+        }
+        assert!(matches!(
+            classify_outcome(Some(&saved), false, Ok(())),
+            SubagentOutcome::Completed(_)
+        ));
+    }
+
+    #[test]
+    fn max_turn_failure_preserves_partial_text_and_completed_tool_once() {
+        let saved = Conversation::new_unvalidated([
+            Message::user().with_text("task"),
+            Message::assistant().with_text("partial checkpoint"),
+            Message::user().with_tool_response(
+                "tool",
+                Ok(CallToolResult::success(vec![ContentBlock::text(
+                    "unique-tool-result",
+                )])),
+            ),
+            Message::assistant().with_text(MAX_TURNS_MESSAGE),
+            Message::assistant()
+                .with_system_notification(SystemNotificationType::InlineMessage, "notice"),
+        ]);
+        let SubagentOutcome::Failed(reason) = classify_outcome(Some(&saved), false, Ok(())) else {
+            panic!("max turns must fail")
+        };
+        assert!(reason.contains("max turns reached"));
+        assert!(reason.contains("partial checkpoint"));
+        assert_eq!(reason.matches("unique-tool-result").count(), 1);
     }
 }
