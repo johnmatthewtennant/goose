@@ -1249,6 +1249,19 @@ fn capacity_response(status: &str, output: serde_json::Value) -> serde_json::Val
 }
 
 async fn assert_responses_prompt_outcome(state_machine: bool, scenario: &str, databricks_v2: bool) {
+    assert_provider_outcome(state_machine, scenario, databricks_v2, false).await;
+}
+
+async fn assert_delegated_provider_outcome(state_machine: bool, scenario: &str) {
+    assert_provider_outcome(state_machine, scenario, false, true).await;
+}
+
+async fn assert_provider_outcome(
+    state_machine: bool,
+    scenario: &str,
+    databricks_v2: bool,
+    delegated: bool,
+) {
     use serde_json::json;
     use wiremock::ResponseTemplate;
 
@@ -1270,7 +1283,7 @@ async fn assert_responses_prompt_outcome(state_machine: bool, scenario: &str, da
         }),
     ]);
     let events = match scenario {
-        "normal" => vec![
+        "normal" | "transient_post_retry" => vec![
             created.clone(),
             json!({
                 "type": "response.completed", "sequence_number": 2,
@@ -1281,10 +1294,18 @@ async fn assert_responses_prompt_outcome(state_machine: bool, scenario: &str, da
             }),
         ],
         "http_503" => vec![],
-        "untyped_overload" | "recovered_overload" | "capped_overload" => vec![
-            created.clone(),
-            json!({"error": overload, "sequence_number": 2}),
-        ],
+        "untyped_overload" | "recovered_overload" | "capped_overload" => {
+            let mut events = vec![created.clone()];
+            if delegated {
+                events.push(
+                    json!({"type": "response.output_text.delta", "sequence_number": 2,
+                    "item_id": "msg_capacity", "output_index": 0, "content_index": 0,
+                    "delta": "Working on it"}),
+                );
+            }
+            events.push(json!({"error": overload, "sequence_number": events.len() + 1}));
+            events
+        }
         "nested_typed_overload" => vec![
             created.clone(),
             json!({"type": "error", "error": overload, "sequence_number": 2}),
@@ -1364,6 +1385,8 @@ fi
         tool_response,
         final_response,
         recovery_response,
+        (scenario == "transient_post_retry")
+            .then(|| ResponseTemplate::new(503).set_body_json(json!({"error": overload}))),
     )
     .await;
     let provider_factory: Option<goose::acp::server::AcpProviderFactory> = if databricks_v2 {
@@ -1395,6 +1418,16 @@ fi
     let mut conn = <AcpServerConnection as Connection>::new(
         TestConnectionConfig {
             provider_factory,
+            builtins: if delegated {
+                vec!["summon".into()]
+            } else {
+                vec![]
+            },
+            goose_mode: if delegated {
+                GooseMode::Auto
+            } else {
+                GooseMode::default()
+            },
             current_model: "gpt-5.2".to_string(),
             mcp_servers: vec![McpServer::Http(McpServerHttp::new("mcp-fixture", &mcp.url))],
             ..Default::default()
@@ -1403,6 +1436,95 @@ fi
     )
     .await;
     let SessionData { mut session, .. } = conn.new_session().await.unwrap();
+    if delegated {
+        use common_tests::fixtures::send_custom;
+        let parent = session.session_id().0.to_string();
+        let delegated = send_custom(conn.cx(), "_goose/unstable/tools/call", json!({
+            "sessionId": parent, "extensionName": "summon", "name": "delegate",
+            "arguments": { "async": true, "model": "gpt-5.2", "instructions": "Use get_code, then report completion.", "max_turns": 10 }
+        })).await.unwrap();
+        let manager = SessionManager::new(conn.data_root());
+        let task = manager
+            .list_all_sessions()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|child| child.parent_session_id.as_deref() == Some(parent.as_str()))
+            .expect("delegation creates owned child")
+            .id;
+        assert!(delegated.to_string().contains(&task));
+        let loaded = tokio::time::timeout(std::time::Duration::from_secs(120), send_custom(conn.cx(), "_goose/unstable/tools/call", json!({
+            "sessionId": parent, "extensionName": "summon", "name": "load", "arguments": { "source": task }
+        }))).await.expect("delegated worker must terminate").unwrap();
+        let output = loaded.to_string();
+        let successful = matches!(scenario, "normal" | "transient_post_retry");
+        if successful {
+            assert!(output.contains("completed"), "{output}");
+            assert!(output.contains("Finished successfully."), "{output}");
+        } else {
+            assert!(
+                output.contains("failed"),
+                "provider failure must fail delegated completion, not succeed: {output}"
+            );
+            assert!(
+                output.contains("Working on it"),
+                "partial output must survive failure: {output}"
+            );
+        }
+        let child = manager.get_session(&task, true).await.unwrap();
+        let conversation = child.conversation.unwrap();
+        assert_eq!(
+            conversation
+                .messages()
+                .iter()
+                .flat_map(|message| &message.content)
+                .filter_map(|content| content.as_tool_response_text())
+                .filter(|text| text.contains(FAKE_CODE))
+                .count(),
+            1,
+            "delegated MCP result must be persisted exactly once"
+        );
+        if !successful {
+            assert!(conversation
+                .messages()
+                .iter()
+                .any(|message| message.error_kind().is_some()));
+            assert!(
+                output.contains(FAKE_CODE),
+                "failed result must retain completed tool output"
+            );
+        }
+        if scenario == "transient_post_retry" {
+            // Provider-internal POST retry, not saved-error/Stop or recipe recovery.
+            let requests = conn.provider_request_bodies().await;
+            let post_tool: Vec<_> = requests
+                .iter()
+                .filter(|body| {
+                    body["input"].as_array().is_some_and(|input| {
+                        input
+                            .iter()
+                            .any(|item| item["type"] == "function_call_output")
+                    })
+                })
+                .collect();
+            assert_eq!(
+                post_tool.len(),
+                2,
+                "one failed POST and one successful retry"
+            );
+            assert_eq!(
+                post_tool[0]["input"], post_tool[1]["input"],
+                "retry must carry the same completed tool result"
+            );
+            assert_eq!(
+                requests.len(),
+                3,
+                "the tool-producing inference must not be replayed"
+            );
+            assert!(conversation.terminal_error().is_none());
+        }
+        return;
+    }
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(120),
         session.prompt(
@@ -1704,4 +1826,31 @@ fn test_shell_terminal_false() {
 #[test]
 fn test_shell_terminal_true() {
     run_test(async { run_shell_terminal_true::<AcpServerConnection>().await });
+}
+
+#[test]
+fn test_delegated_exhausted_provider_failure_legacy() {
+    run_test(async { assert_delegated_provider_outcome(false, "untyped_overload").await });
+}
+#[test]
+fn test_delegated_success_legacy() {
+    run_test(async { assert_delegated_provider_outcome(false, "normal").await });
+}
+#[test]
+fn test_delegated_exhausted_provider_failure_state_machine() {
+    run_test(async { assert_delegated_provider_outcome(true, "untyped_overload").await });
+}
+
+#[test]
+fn test_delegated_success_state_machine() {
+    run_test(async { assert_delegated_provider_outcome(true, "normal").await });
+}
+
+#[test]
+fn test_delegated_provider_internal_post_retry_legacy() {
+    run_test(async { assert_delegated_provider_outcome(false, "transient_post_retry").await });
+}
+#[test]
+fn test_delegated_provider_internal_post_retry_state_machine() {
+    run_test(async { assert_delegated_provider_outcome(true, "transient_post_retry").await });
 }

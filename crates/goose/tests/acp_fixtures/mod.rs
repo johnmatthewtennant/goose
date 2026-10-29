@@ -299,14 +299,16 @@ impl OpenAiFixture {
         tool_response: String,
         final_response: ResponseTemplate,
     ) -> Self {
-        Self::responses_after_tool_with_recovery(tool_response, final_response, None).await
+        Self::responses_after_tool_with_recovery(tool_response, final_response, None, None).await
     }
 
     pub async fn responses_after_tool_with_recovery(
         tool_response: String,
         final_response: ResponseTemplate,
         recovery_response: Option<ResponseTemplate>,
+        transient_failure: Option<ResponseTemplate>,
     ) -> Self {
+        let post_tool_attempts = std::sync::atomic::AtomicUsize::new(0);
         let fixture = Self::new(vec![], Arc::new(goose_test_support::IgnoreSessionId)).await;
         Mock::given(method("POST"))
             .and(|request: &wiremock::Request| {
@@ -330,6 +332,11 @@ impl OpenAiFixture {
                 }) {
                     response.clone()
                 } else if has_tool_result {
+                    if post_tool_attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        if let Some(failure) = &transient_failure {
+                            return failure.clone();
+                        }
+                    }
                     final_response.clone()
                 } else {
                     ResponseTemplate::new(200)
@@ -340,6 +347,17 @@ impl OpenAiFixture {
             .mount(&fixture._server)
             .await;
         fixture
+    }
+
+    pub async fn request_bodies(&self) -> Vec<serde_json::Value> {
+        self._server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| request.method == wiremock::http::Method::POST)
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+            .collect()
     }
 
     pub fn uri(&self) -> &str {

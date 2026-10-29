@@ -99,6 +99,10 @@ impl AcpServerSession {
 }
 
 impl AcpServerConnection {
+    pub async fn provider_request_bodies(&self) -> Vec<serde_json::Value> {
+        self._openai.request_bodies().await
+    }
+
     #[allow(dead_code)]
     pub fn cx(&self) -> &ConnectionTo<Agent> {
         &self.cx

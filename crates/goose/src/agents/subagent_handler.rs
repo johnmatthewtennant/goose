@@ -136,6 +136,7 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             .clone()
             .unwrap_or_else(|| "Begin.".to_string());
 
+        let session_manager = Arc::clone(&config.session_manager);
         let agent = Arc::new(Agent::with_config(config));
 
         agent
@@ -207,43 +208,124 @@ fn get_agent_messages(params: SubagentRunParams) -> AgentMessagesFuture {
             .await
             .map_err(|e| anyhow!("Failed to get reply from agent: {}", e))?;
 
-        while let Some(message_result) = stream.next().await {
-            match message_result {
-                Ok(AgentEvent::Message(msg)) => {
-                    if let Some(ref callback) = on_message {
-                        callback(&msg);
-                    }
-                    if let Some(ref tx) = notification_tx {
-                        for content in &msg.content {
-                            if let Some(notif) = create_tool_notification(content, &session_id) {
-                                if tx.send(notif).is_err() {
-                                    debug!(
-                                        "Notification receiver dropped for subagent {}",
-                                        session_id
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    conversation.push(msg);
-                }
-                Ok(AgentEvent::Usage(_)) => {}
-                Ok(AgentEvent::MessageUsage { .. }) => {}
-                Ok(AgentEvent::McpNotification(_)) => {}
-                Ok(AgentEvent::HistoryReplaced(updated_conversation)) => {
-                    conversation = updated_conversation;
-                }
-                Err(e) => {
-                    tracing::error!("Error receiving message from subagent: {}", e);
-                    break;
-                }
-            }
-        }
+        collect_subagent_stream(
+            &mut stream,
+            &mut conversation,
+            &session_id,
+            on_message.as_ref(),
+            notification_tx.as_ref(),
+        )
+        .await?;
 
+        // Streaming messages can omit persisted errors or include an error that
+        // a Stop hook, steer, or recipe retry subsequently recovers from.
+        let saved = session_manager
+            .get_session(&session_id, true)
+            .await
+            .map_err(|error| {
+                subagent_failure(
+                    &format!("Failed to read final worker outcome: {error}"),
+                    &conversation,
+                )
+            })?;
+        let saved = saved
+            .conversation
+            .as_ref()
+            .ok_or_else(|| subagent_failure("Missing final worker conversation", &conversation))?;
+        check_subagent_outcome(&conversation, saved)?;
         let final_output = get_final_output(&agent, has_response_schema).await;
 
         Ok((conversation, final_output))
     })
+}
+
+async fn collect_subagent_stream(
+    stream: &mut futures::stream::BoxStream<'_, Result<AgentEvent>>,
+    conversation: &mut Conversation,
+    session_id: &str,
+    on_message: Option<&OnMessageCallback>,
+    notification_tx: Option<&tokio::sync::mpsc::UnboundedSender<ServerNotification>>,
+) -> Result<()> {
+    while let Some(message_result) = stream.next().await {
+        match message_result {
+            Ok(AgentEvent::Message(msg)) => {
+                if let Some(callback) = on_message {
+                    callback(&msg);
+                }
+                if let Some(tx) = notification_tx {
+                    for content in &msg.content {
+                        if let Some(notif) = create_tool_notification(content, &session_id) {
+                            if tx.send(notif).is_err() {
+                                debug!("Notification receiver dropped for subagent {}", session_id);
+                            }
+                        }
+                    }
+                }
+                conversation.push(msg);
+            }
+            Ok(AgentEvent::Usage(_)) => {}
+            Ok(AgentEvent::MessageUsage { .. }) => {}
+            Ok(AgentEvent::McpNotification(_)) => {}
+            Ok(AgentEvent::HistoryReplaced(updated_conversation)) => {
+                *conversation = updated_conversation;
+            }
+            Err(e) => {
+                return Err(subagent_failure(
+                    &format!("Agent response stream failed: {e}"),
+                    &conversation,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn subagent_failure(reason: &str, conversation: &Conversation) -> anyhow::Error {
+    anyhow!(
+        "{reason}\n\n## Worker progress\n\n{}",
+        extract_response_text(conversation, false)
+    )
+}
+
+fn check_subagent_outcome(observed: &Conversation, saved: &Conversation) -> Result<()> {
+    use crate::conversation::message::{MessageErrorKind, SystemNotificationType};
+    // Authentication and credit exhaustion remain explicit, even when another
+    // operation emits text later. Operational errors use the final saved turn.
+    for content in observed
+        .messages()
+        .iter()
+        .flat_map(|message| &message.content)
+    {
+        match content {
+            MessageContent::Error(error)
+                if matches!(
+                    error.kind,
+                    MessageErrorKind::Authentication | MessageErrorKind::CreditsExhausted
+                ) =>
+            {
+                return Err(subagent_failure(
+                    &format!("{:?}: {}", error.kind, error.message),
+                    saved,
+                ));
+            }
+            MessageContent::SystemNotification(notice)
+                if notice.notification_type == SystemNotificationType::CreditsExhausted =>
+            {
+                return Err(subagent_failure(
+                    &format!("CreditsExhausted: {}", notice.msg),
+                    saved,
+                ));
+            }
+            _ => {}
+        }
+    }
+    if let Some(error) = saved.terminal_error() {
+        return Err(subagent_failure(
+            &format!("{:?}: {}", error.kind, error.message),
+            saved,
+        ));
+    }
+    Ok(())
 }
 
 async fn build_subagent_prompt(
@@ -360,5 +442,80 @@ mod tests {
     fn create_tool_notification_ignores_non_tool_request() {
         let content = MessageContent::text("hello");
         assert!(create_tool_notification(&content, "session_1").is_none());
+    }
+}
+
+#[cfg(test)]
+mod terminal_outcome_tests {
+    use super::*;
+    use crate::conversation::message::{MessageErrorKind, SystemNotificationType};
+    use futures::stream;
+
+    #[tokio::test]
+    async fn stream_error_cannot_become_success_and_retains_progress() {
+        let mut conversation = Conversation::empty();
+        let mut stream: futures::stream::BoxStream<'_, Result<AgentEvent>> =
+            Box::pin(stream::iter([
+                Ok(AgentEvent::Message(
+                    Message::assistant().with_text("partial checkpoint"),
+                )),
+                Err(anyhow!("transport disconnected")),
+            ]));
+        let error = collect_subagent_stream(&mut stream, &mut conversation, "worker", None, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("transport disconnected"));
+        assert!(error.contains("partial checkpoint"));
+    }
+
+    #[test]
+    fn saved_final_outcome_allows_recovery_but_not_notice_only_masking() {
+        let observed = Conversation::new_unvalidated([
+            Message::user().with_text("task"),
+            Message::assistant().with_text("partial checkpoint"),
+            Message::assistant().with_error(MessageErrorKind::Other, "provider failed"),
+        ]);
+        let mut saved = observed.clone();
+        saved.push(Message::assistant().with_system_notification(
+            SystemNotificationType::InlineMessage,
+            "Stop hook cap reached",
+        ));
+        let error = check_subagent_outcome(&observed, &saved)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("provider failed"));
+        assert!(error.contains("partial checkpoint"));
+        saved.push(Message::assistant().with_text("recovered"));
+        assert!(check_subagent_outcome(&observed, &saved).is_ok());
+    }
+
+    #[test]
+    fn authentication_and_credits_remain_explicit_even_after_text() {
+        for kind in [
+            MessageErrorKind::Authentication,
+            MessageErrorKind::CreditsExhausted,
+        ] {
+            let mut saved = Conversation::new_unvalidated([
+                Message::user().with_text("task"),
+                Message::assistant().with_error(kind, "blocked"),
+            ]);
+            saved.push(Message::assistant().with_text("later response"));
+            assert!(check_subagent_outcome(&saved, &saved)
+                .unwrap_err()
+                .to_string()
+                .contains(&format!("{kind:?}")));
+        }
+        let saved = Conversation::new_unvalidated([
+            Message::user().with_text("task"),
+            Message::assistant().with_system_notification(
+                SystemNotificationType::CreditsExhausted,
+                "top up credits",
+            ),
+        ]);
+        assert!(check_subagent_outcome(&saved, &saved)
+            .unwrap_err()
+            .to_string()
+            .contains("CreditsExhausted"));
     }
 }
