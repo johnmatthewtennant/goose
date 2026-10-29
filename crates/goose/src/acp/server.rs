@@ -1699,7 +1699,13 @@ fn prompt_error_from_conversation(
         .iter()
         .rev()
         .take_while(|message| message.role != Role::User)
-        .find(|message| message.role == Role::Assistant)
+        .find(|message| {
+            message.role == Role::Assistant
+                && message
+                    .content
+                    .iter()
+                    .any(|content| !matches!(content, MessageContent::SystemNotification(_)))
+        })
         .and_then(|message| {
             message
                 .content
@@ -3448,6 +3454,11 @@ print(\"hello, world\")
             Message::user().with_text("first prompt"),
             error.clone(),
         ]);
+        assert!(prompt_error_from_conversation(&conversation).is_some());
+        conversation.push(Message::assistant().with_system_notification(
+            SystemNotificationType::InlineMessage,
+            "Stop hook limit reached",
+        ));
         assert!(prompt_error_from_conversation(&conversation).is_some());
         conversation.push(Message::assistant().with_text("recovered"));
         assert!(prompt_error_from_conversation(&conversation).is_none());

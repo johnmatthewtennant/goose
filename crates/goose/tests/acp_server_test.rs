@@ -1281,7 +1281,7 @@ async fn assert_responses_prompt_outcome(state_machine: bool, scenario: &str, da
             }),
         ],
         "http_503" => vec![],
-        "untyped_overload" | "recovered_overload" => vec![
+        "untyped_overload" | "recovered_overload" | "capped_overload" => vec![
             created.clone(),
             json!({"error": overload, "sequence_number": 2}),
         ],
@@ -1317,7 +1317,8 @@ async fn assert_responses_prompt_outcome(state_machine: bool, scenario: &str, da
     };
     let mcp = McpFixture::new().await;
     let recovering = scenario == "recovered_overload";
-    let _stop_hook = if recovering {
+    let capped = scenario == "capped_overload";
+    let _stop_hook = if recovering || capped {
         let plugins = goose::plugins::plugin_install_dir();
         std::fs::create_dir_all(&plugins).unwrap();
         let plugin = tempfile::tempdir_in(plugins).unwrap();
@@ -1328,13 +1329,17 @@ async fn assert_responses_prompt_outcome(state_machine: bool, scenario: &str, da
         ).unwrap();
         std::fs::write(
             plugin.path().join("recover.sh"),
-            r#"cat >/dev/null
+            if capped {
+                "cat >/dev/null\necho 'Recover the failed provider turn' >&2\nexit 2\n"
+            } else {
+                r#"cat >/dev/null
 if [ ! -f "$PLUGIN_ROOT/denied" ]; then
     touch "$PLUGIN_ROOT/denied"
     echo 'Recover the failed provider turn' >&2
     exit 2
 fi
-"#,
+"#
+            },
         )
         .unwrap();
         Some(plugin)
@@ -1471,6 +1476,14 @@ fi
         .await
         .unwrap();
     let conversation = stored.conversation.unwrap();
+    if capped {
+        assert!(conversation
+            .messages()
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|content| content.as_system_notification())
+            .any(|notice| notice.msg.contains("overriding and ending turn")));
+    }
     if recovering {
         assert!(
             conversation
@@ -1499,6 +1512,25 @@ fi
         1,
         "the real MCP result must be persisted exactly once"
     );
+}
+
+#[test]
+fn test_capacity_capped_overload_legacy() {
+    run_test(async {
+        let previous = std::env::var_os("GOOSE_STOP_HOOK_BLOCK_CAP");
+        std::env::set_var("GOOSE_STOP_HOOK_BLOCK_CAP", "0");
+        let task = tokio::spawn(assert_responses_prompt_outcome(
+            false,
+            "capped_overload",
+            false,
+        ))
+        .await;
+        match previous {
+            Some(value) => std::env::set_var("GOOSE_STOP_HOOK_BLOCK_CAP", value),
+            None => std::env::remove_var("GOOSE_STOP_HOOK_BLOCK_CAP"),
+        }
+        task.unwrap();
+    });
 }
 
 #[test]
