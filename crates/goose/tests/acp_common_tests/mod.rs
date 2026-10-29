@@ -526,7 +526,10 @@ pub async fn run_load_mode<C: Connection>() {
         .await
         .unwrap();
     assert_eq!(output.tool_status.unwrap(), ToolCallStatus::Failed);
-    assert_eq!(output.text, "The tool call was declined. I will not retry it.");
+    assert_eq!(
+        output.text,
+        "The tool call was declined. I will not retry it."
+    );
     assert_notifications(
         &loaded.notifications(),
         &[
@@ -903,7 +906,10 @@ async fn run_mode_set_impl<C: Connection>(via: SetModeVia) {
         .await
         .unwrap();
     assert_eq!(output.tool_status.unwrap(), ToolCallStatus::Failed);
-    assert_eq!(output.text, "The tool call was declined. I will not retry it.");
+    assert_eq!(
+        output.text,
+        "The tool call was declined. I will not retry it."
+    );
     assert_notifications(
         &session_b.notifications(),
         &[

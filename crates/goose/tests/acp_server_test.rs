@@ -1248,11 +1248,7 @@ fn capacity_response(status: &str, output: serde_json::Value) -> serde_json::Val
     })
 }
 
-async fn assert_responses_prompt_outcome(
-    state_machine: bool,
-    scenario: &str,
-    databricks_v2: bool,
-) {
+async fn assert_responses_prompt_outcome(state_machine: bool, scenario: &str, databricks_v2: bool) {
     use serde_json::json;
     use wiremock::ResponseTemplate;
 
@@ -1340,7 +1336,8 @@ async fn assert_responses_prompt_outcome(
                     None,
                     None,
                 )?;
-                Ok(std::sync::Arc::new(provider) as std::sync::Arc<dyn goose::providers::base::Provider>)
+                Ok(std::sync::Arc::new(provider)
+                    as std::sync::Arc<dyn goose::providers::base::Provider>)
             })
         }))
     } else {
@@ -1379,25 +1376,44 @@ async fn assert_responses_prompt_outcome(
         if scenario.contains("overload") {
             assert!(detail.contains("server_is_overloaded"), "{error:?}");
         } else if scenario == "http_503" {
-            assert!(detail.contains("Our servers are currently overloaded"), "{error:?}");
+            assert!(
+                detail.contains("Our servers are currently overloaded"),
+                "{error:?}"
+            );
         }
         let stored = SessionManager::new(conn.data_root())
             .get_session(&session.session_id().0, true)
             .await
             .unwrap();
         let conversation = stored.conversation.unwrap();
-        assert!(conversation.messages().iter().any(|message| message.error_kind().is_some()), "the error must be persisted before ACP rejects the prompt");
+        assert!(
+            conversation
+                .messages()
+                .iter()
+                .any(|message| message.error_kind().is_some()),
+            "the error must be persisted before ACP rejects the prompt"
+        );
         if scenario == "partial_text_eof" {
-            assert!(conversation.messages().iter().any(|message| message.as_concat_text().contains("Working on it")), "partial output must survive the error");
+            assert!(
+                conversation
+                    .messages()
+                    .iter()
+                    .any(|message| message.as_concat_text().contains("Working on it")),
+                "partial output must survive the error"
+            );
         }
     }
     assert_eq!(
-        session.notifications().iter().filter(|notification| matches!(
-            notification,
-            common_tests::fixtures::Notification::ToolCallStatus(
-                agent_client_protocol::schema::v1::ToolCallStatus::Completed
-            )
-        )).count(),
+        session
+            .notifications()
+            .iter()
+            .filter(|notification| matches!(
+                notification,
+                common_tests::fixtures::Notification::ToolCallStatus(
+                    agent_client_protocol::schema::v1::ToolCallStatus::Completed
+                )
+            ))
+            .count(),
         1,
         "the MCP tool must complete exactly once despite provider retries"
     );
@@ -1407,7 +1423,9 @@ async fn assert_responses_prompt_outcome(
         .unwrap();
     let conversation = stored.conversation.unwrap();
     assert_eq!(
-        conversation.messages().iter()
+        conversation
+            .messages()
+            .iter()
             .flat_map(|message| &message.content)
             .filter_map(|content| content.as_tool_response_text())
             .filter(|text| text.contains(FAKE_CODE))

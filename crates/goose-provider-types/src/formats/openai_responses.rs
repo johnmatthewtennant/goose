@@ -345,9 +345,9 @@ fn parse_responses_stream_event(data_line: &str) -> anyhow::Result<Option<Respon
                 .flatten()
                 .filter(|error| !error.is_null())
         });
-    if let Some(error) = error.or_else(|| {
-        matches!(event_type, Some("error" | "response.failed")).then_some(&raw_event)
-    }) {
+    if let Some(error) = error
+        .or_else(|| matches!(event_type, Some("error" | "response.failed")).then_some(&raw_event))
+    {
         return Err(responses_stream_error(error).into());
     }
 
