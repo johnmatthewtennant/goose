@@ -1281,7 +1281,7 @@ async fn assert_responses_prompt_outcome(state_machine: bool, scenario: &str, da
             }),
         ],
         "http_503" => vec![],
-        "untyped_overload" => vec![
+        "untyped_overload" | "recovered_overload" => vec![
             created.clone(),
             json!({"error": overload, "sequence_number": 2}),
         ],
@@ -1316,7 +1316,51 @@ async fn assert_responses_prompt_outcome(state_machine: bool, scenario: &str, da
             .set_body_string(responses_sse(events))
     };
     let mcp = McpFixture::new().await;
-    let openai = OpenAiFixture::responses_after_tool(tool_response, final_response).await;
+    let recovering = scenario == "recovered_overload";
+    let _stop_hook = if recovering {
+        let plugins = goose::plugins::plugin_install_dir();
+        std::fs::create_dir_all(&plugins).unwrap();
+        let plugin = tempfile::tempdir_in(plugins).unwrap();
+        std::fs::create_dir_all(plugin.path().join("hooks")).unwrap();
+        std::fs::write(
+            plugin.path().join("hooks/hooks.json"),
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"sh ${PLUGIN_ROOT}/recover.sh"}]}]}}"#,
+        ).unwrap();
+        std::fs::write(
+            plugin.path().join("recover.sh"),
+            r#"cat >/dev/null
+if [ ! -f "$PLUGIN_ROOT/denied" ]; then
+    touch "$PLUGIN_ROOT/denied"
+    echo 'Recover the failed provider turn' >&2
+    exit 2
+fi
+"#,
+        )
+        .unwrap();
+        Some(plugin)
+    } else {
+        None
+    };
+    let recovery_response = recovering.then(|| {
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string(responses_sse(vec![
+                created,
+                json!({
+                    "type": "response.completed", "sequence_number": 2,
+                    "response": capacity_response("completed", json!([{
+                        "type": "message", "role": "assistant",
+                        "content": [{"type": "output_text", "text": "Finished successfully."}]
+                    }]))
+                }),
+            ]))
+    });
+    let openai = OpenAiFixture::responses_after_tool_with_recovery(
+        tool_response,
+        final_response,
+        recovery_response,
+    )
+    .await;
     let provider_factory: Option<goose::acp::server::AcpProviderFactory> = if databricks_v2 {
         let host = openai.uri().to_string();
         Some(std::sync::Arc::new(move |_, _, _, _| {
@@ -1363,8 +1407,13 @@ async fn assert_responses_prompt_outcome(state_machine: bool, scenario: &str, da
     )
     .await
     .expect("ACP prompt must terminate, even after a provider failure");
-    if scenario == "normal" {
-        assert_eq!(result.unwrap().text, "Finished successfully.");
+    if scenario == "normal" || recovering {
+        assert_eq!(
+            result
+                .expect("recovered provider failure must not reject ACP")
+                .text,
+            "Finished successfully."
+        );
     } else {
         let error =
             result.expect_err("provider failure must reject the ACP prompt, not return EndTurn");
@@ -1422,6 +1471,23 @@ async fn assert_responses_prompt_outcome(state_machine: bool, scenario: &str, da
         .await
         .unwrap();
     let conversation = stored.conversation.unwrap();
+    if recovering {
+        assert!(
+            conversation
+                .messages()
+                .iter()
+                .any(|message| message.error_kind().is_some()),
+            "the recovered turn must include an actual persisted provider error"
+        );
+        assert_eq!(
+            conversation.messages().last().unwrap().as_concat_text(),
+            "Finished successfully."
+        );
+        assert!(
+            _stop_hook.as_ref().unwrap().path().join("denied").exists(),
+            "the Stop hook must deny once before recovery"
+        );
+    }
     assert_eq!(
         conversation
             .messages()
@@ -1433,6 +1499,11 @@ async fn assert_responses_prompt_outcome(state_machine: bool, scenario: &str, da
         1,
         "the real MCP result must be persisted exactly once"
     );
+}
+
+#[test]
+fn test_capacity_recovered_overload_legacy() {
+    run_test(async { assert_responses_prompt_outcome(false, "recovered_overload", false).await });
 }
 
 macro_rules! responses_prompt_tests {

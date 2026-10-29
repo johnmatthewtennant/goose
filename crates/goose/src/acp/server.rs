@@ -1691,6 +1691,23 @@ fn prompt_error_from_message_content(
     }
 }
 
+fn prompt_error_from_conversation(
+    conversation: &Conversation,
+) -> Option<agent_client_protocol::Error> {
+    conversation
+        .messages()
+        .iter()
+        .rev()
+        .take_while(|message| message.role != Role::User)
+        .find(|message| message.role == Role::Assistant)
+        .and_then(|message| {
+            message
+                .content
+                .iter()
+                .find_map(prompt_error_from_message_content)
+        })
+}
+
 fn credits_exhausted_prompt_error(
     notification: &SystemNotificationContent,
 ) -> agent_client_protocol::Error {
@@ -2140,6 +2157,7 @@ impl GooseAcpAgent {
         let mut chain_tracker = ToolChainTracker::default();
         let mut context_limit = None;
         let mut prompt_error = None;
+        let mut saw_operational_error = false;
         let target = SessionAgentTarget {
             agent: agent.clone(),
             session_id: session_id.to_string(),
@@ -2168,7 +2186,13 @@ impl GooseAcpAgent {
                         if let Some(error) = prompt_error_from_message_content(content_item) {
                             // Drain the turn so both loops persist partial output and error
                             // before the client can retry or reload the conversation.
-                            prompt_error.get_or_insert(error);
+                            if matches!(content_item, MessageContent::Error(error)
+                                if error.kind == crate::conversation::message::MessageErrorKind::Other)
+                            {
+                                saw_operational_error = true;
+                            } else {
+                                prompt_error.get_or_insert(error);
+                            }
                             continue;
                         }
 
@@ -2260,6 +2284,22 @@ impl GooseAcpAgent {
 
         if let Some(error) = prompt_error {
             return Err(error);
+        }
+        if saw_operational_error && !was_cancelled {
+            // A Stop hook, steer, or recipe retry can recover an earlier error.
+            // Only the saved terminal outcome determines whether this turn failed.
+            let session = self
+                .session_manager
+                .get_session(session_id, true)
+                .await
+                .internal_err_ctx("Failed to load session")?;
+            if let Some(error) = session
+                .conversation
+                .as_ref()
+                .and_then(prompt_error_from_conversation)
+            {
+                return Err(error);
+            }
         }
 
         Ok(AgentStreamOutcome {
@@ -3397,6 +3437,24 @@ print(\"hello, world\")
             error.code,
             agent_client_protocol::schema::v1::ErrorCode::AuthRequired
         );
+    }
+
+    #[test]
+    fn test_prompt_error_uses_terminal_assistant_in_current_turn() {
+        use crate::conversation::message::MessageErrorKind;
+
+        let error = Message::assistant().with_error(MessageErrorKind::Other, "provider failed");
+        let mut conversation = Conversation::new_unvalidated([
+            Message::user().with_text("first prompt"),
+            error.clone(),
+        ]);
+        assert!(prompt_error_from_conversation(&conversation).is_some());
+        conversation.push(Message::assistant().with_text("recovered"));
+        assert!(prompt_error_from_conversation(&conversation).is_none());
+        conversation.push(error);
+        assert!(prompt_error_from_conversation(&conversation).is_some());
+        conversation.push(Message::user().with_text("next prompt"));
+        assert!(prompt_error_from_conversation(&conversation).is_none());
     }
 
     #[test]

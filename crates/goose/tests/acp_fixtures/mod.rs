@@ -299,6 +299,14 @@ impl OpenAiFixture {
         tool_response: String,
         final_response: ResponseTemplate,
     ) -> Self {
+        Self::responses_after_tool_with_recovery(tool_response, final_response, None).await
+    }
+
+    pub async fn responses_after_tool_with_recovery(
+        tool_response: String,
+        final_response: ResponseTemplate,
+        recovery_response: Option<ResponseTemplate>,
+    ) -> Self {
         let fixture = Self::new(vec![], Arc::new(goose_test_support::IgnoreSessionId)).await;
         Mock::given(method("POST"))
             .and(|request: &wiremock::Request| {
@@ -315,7 +323,13 @@ impl OpenAiFixture {
                             .as_str()
                             .is_some_and(|output| output.contains(goose_test_support::FAKE_CODE))
                 });
-                if has_tool_result {
+                if let Some(response) = recovery_response.as_ref().filter(|_| {
+                    body["input"]
+                        .to_string()
+                        .contains("Recover the failed provider turn")
+                }) {
+                    response.clone()
+                } else if has_tool_result {
                     final_response.clone()
                 } else {
                     ResponseTemplate::new(200)
