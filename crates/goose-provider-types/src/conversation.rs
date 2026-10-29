@@ -43,6 +43,27 @@ impl Conversation {
         &self.0
     }
 
+    /// The typed terminal error in the latest user turn, ignoring notice-only records.
+    /// A later substantive assistant response supersedes an earlier error.
+    pub fn terminal_error(&self) -> Option<&message::ErrorContent> {
+        self.0
+            .iter()
+            .rev()
+            .take_while(|message| message.role != Role::User)
+            .find(|message| {
+                message.role == Role::Assistant
+                    && message.content.iter().any(|content| {
+                        !matches!(content, MessageContentBlock::SystemNotification(_))
+                    })
+            })
+            .and_then(|message| {
+                message.content.iter().find_map(|content| match content {
+                    MessageContentBlock::Error(error) => Some(error),
+                    _ => None,
+                })
+            })
+    }
+
     pub fn messages_mut(&mut self) -> &mut Vec<Message> {
         &mut self.0
     }
@@ -2011,6 +2032,40 @@ mod tests {
                 assert_eq!(c.text, "and now text");
             }
             other => panic!("unexpected content shape: {:?}", other),
+        }
+    }
+}
+
+#[cfg(test)]
+mod terminal_outcome_tests {
+    use super::*;
+    use message::{MessageErrorKind, SystemNotificationType};
+
+    #[test]
+    fn terminal_error_is_typed_turn_bounded_and_ignores_only_notices() {
+        for kind in [
+            MessageErrorKind::Authentication,
+            MessageErrorKind::CreditsExhausted,
+            MessageErrorKind::Other,
+            MessageErrorKind::ContextLengthExceeded,
+        ] {
+            let mut conversation = Conversation::new_unvalidated([
+                Message::user().with_text("task"),
+                Message::assistant().with_error(kind, "blocked"),
+            ]);
+            conversation.push(
+                Message::assistant()
+                    .with_system_notification(SystemNotificationType::InlineMessage, "Stop cap"),
+            );
+            assert_eq!(
+                conversation.terminal_error().map(|error| error.kind),
+                Some(kind)
+            );
+            conversation.push(Message::assistant().with_text("recovered"));
+            assert!(conversation.terminal_error().is_none());
+            conversation.push(Message::assistant().with_error(kind, "failed again"));
+            conversation.push(Message::user().with_text("next request"));
+            assert!(conversation.terminal_error().is_none());
         }
     }
 }
