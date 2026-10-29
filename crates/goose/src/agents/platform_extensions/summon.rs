@@ -1,17 +1,17 @@
+use crate::agents::AgentConfig;
 use crate::agents::extension::PlatformExtensionContext;
 use crate::agents::mcp_client::{Error, McpClientTrait};
-use crate::agents::subagent_handler::{run_subagent_task, OnMessageCallback, SubagentRunParams};
-use crate::agents::subagent_task_config::{TaskConfig, DEFAULT_SUBAGENT_MAX_TURNS};
+use crate::agents::subagent_handler::{OnMessageCallback, SubagentRunParams, run_subagent_task};
+use crate::agents::subagent_task_config::{DEFAULT_SUBAGENT_MAX_TURNS, TaskConfig};
 use crate::agents::tool_execution::{ToolCallContext, ToolCallNotificationEmitter};
-use crate::agents::AgentConfig;
 use crate::config::paths::Paths;
 use crate::config::{Config, GooseMode};
 use crate::providers;
 use crate::recipe::build_recipe::build_recipe_from_template;
 use crate::recipe::local_recipes::load_local_recipe_file;
-use crate::recipe::{Recipe, RecipeParameter, Settings, RECIPE_FILE_EXTENSIONS};
-use crate::session::extension_data::EnabledExtensionsState;
+use crate::recipe::{RECIPE_FILE_EXTENSIONS, Recipe, RecipeParameter, Settings};
 use crate::session::SessionType;
+use crate::session::extension_data::EnabledExtensionsState;
 use crate::sources::parse_frontmatter;
 use crate::utils::safe_truncate;
 use anyhow::Result;
@@ -26,8 +26,8 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
@@ -123,7 +123,45 @@ pub struct CompletedTask {
     pub turns_taken: u32,
     pub duration: Duration,
     pub completed_at: Instant,
+    pub status: TaskCompletionStatus,
     notification_sink: SharedNotificationSink,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskCompletionStatus {
+    Completed,
+    ActionLimitReached,
+}
+
+const ACTION_LIMIT_MESSAGE: &str =
+    "I've reached the maximum number of actions I can do without user input";
+
+fn completion_status_for_output(output: &str) -> TaskCompletionStatus {
+    if output.contains(ACTION_LIMIT_MESSAGE) {
+        TaskCompletionStatus::ActionLimitReached
+    } else {
+        TaskCompletionStatus::Completed
+    }
+}
+
+fn task_status_label(
+    status: TaskCompletionStatus,
+    result: &Result<String, String>,
+) -> &'static str {
+    match (status, result) {
+        (_, Err(_)) => "✗ Failed",
+        (TaskCompletionStatus::ActionLimitReached, Ok(_)) => "⚠ Action limit reached",
+        (TaskCompletionStatus::Completed, Ok(_)) => "✓ Completed",
+    }
+}
+
+fn task_status_key(status: TaskCompletionStatus, result: &Result<String, String>) -> &'static str {
+    match (status, result) {
+        (_, Err(e)) if e.starts_with("Task panicked:") => "panicked",
+        (_, Err(_)) => "failed",
+        (TaskCompletionStatus::ActionLimitReached, Ok(_)) => "action_limit_reached",
+        (TaskCompletionStatus::Completed, Ok(_)) => "completed",
+    }
 }
 
 enum NotificationSink {
@@ -1083,27 +1121,26 @@ impl SummonClient {
                 task.description.clone(),
                 task.duration,
                 task.turns_taken,
+                task.status,
                 Arc::clone(&task.notification_sink),
             )
         });
 
-        if let Some((result, description, duration, turns_taken, notification_sink)) =
-            completed_entry
+        if let Some((
+            result,
+            description,
+            duration,
+            turns_taken,
+            completion_status,
+            notification_sink,
+        )) = completed_entry
         {
             if !peek {
                 Self::attach_notification_emitter(&notification_sink, notification_emitter).await;
                 completed.remove(task_id);
             }
-            let status_key = match &result {
-                Ok(_) => "completed",
-                Err(e) if e.starts_with("Task panicked:") => "panicked",
-                Err(_) => "failed",
-            };
-            let status = match status_key {
-                "completed" => "✓ Completed",
-                "panicked" => "✗ Panicked",
-                _ => "✗ Failed",
-            };
+            let status_key = task_status_key(completion_status, &result);
+            let status = task_status_label(completion_status, &result);
             let output = match result {
                 Ok(output) => output,
                 Err(error) => format!("Error: {}", error),
@@ -1279,10 +1316,10 @@ impl SummonClient {
             let mut sorted_completed: Vec<_> = completed.values().collect();
             sorted_completed.sort_by_key(|t| &t.id);
             for task in sorted_completed {
-                let status = if task.result.is_ok() {
-                    "completed"
-                } else {
-                    "failed"
+                let status = match (task.status, &task.result) {
+                    (_, Err(_)) => "failed",
+                    (TaskCompletionStatus::ActionLimitReached, Ok(_)) => "action limit reached",
+                    (TaskCompletionStatus::Completed, Ok(_)) => "completed",
                 };
                 output.push_str(&format!(
                     "• {} - \"{}\" ({})\n",
@@ -2011,18 +2048,29 @@ impl SummonClient {
                 .unwrap_or_else(|| task.turns.load(Ordering::Relaxed));
             let duration = task.started_at.elapsed();
 
-            let result = match task.handle.await {
+            let (result, status) = match task.handle.await {
                 Ok(Ok(output)) => {
-                    info!("Background task {} completed successfully", id);
-                    Ok(output)
+                    let status = completion_status_for_output(&output);
+                    match status {
+                        TaskCompletionStatus::Completed => {
+                            info!("Background task {} completed successfully", id);
+                        }
+                        TaskCompletionStatus::ActionLimitReached => {
+                            warn!("Background task {} reached its action limit", id);
+                        }
+                    }
+                    (Ok(output), status)
                 }
                 Ok(Err(e)) => {
                     warn!("Background task {} failed: {}", id, e);
-                    Err(e.to_string())
+                    (Err(e.to_string()), TaskCompletionStatus::Completed)
                 }
                 Err(e) => {
                     warn!("Background task {} panicked: {}", id, e);
-                    Err(format!("Task panicked: {}", e))
+                    (
+                        Err(format!("Task panicked: {}", e)),
+                        TaskCompletionStatus::Completed,
+                    )
                 }
             };
 
@@ -2035,6 +2083,7 @@ impl SummonClient {
                     turns_taken,
                     duration,
                     completed_at: Instant::now(),
+                    status,
                     notification_sink: task.notification_sink,
                 },
             );
@@ -2305,10 +2354,10 @@ impl McpClientTrait for SummonClient {
         sorted_completed.sort_by_key(|task| &task.id);
 
         for task in sorted_completed {
-            let status = if task.result.is_ok() {
-                "completed"
-            } else {
-                "failed"
+            let status = match (task.status, &task.result) {
+                (_, Err(_)) => "failed",
+                (TaskCompletionStatus::ActionLimitReached, Ok(_)) => "action limit reached",
+                (TaskCompletionStatus::Completed, Ok(_)) => "completed",
             };
             lines.push(format!(
                 "• {}: \"{}\" - {} in {} ({} turns) - use load(\"{}\") to get result",
@@ -3619,9 +3668,11 @@ You review code."#;
             )
             .unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("No model configured for provider 'lmstudio'"));
+        assert!(
+            error
+                .to_string()
+                .contains("No model configured for provider 'lmstudio'")
+        );
     }
 
     fn test_tool_notification(request_id: &str, subagent_id: &str) -> ServerNotification {
@@ -3732,7 +3783,7 @@ You review code."#;
 
     #[tokio::test]
     async fn test_live_notifications_precede_delegate_result() {
-        use crate::agents::tool_execution::{tool_stream, ToolStreamItem};
+        use crate::agents::tool_execution::{ToolStreamItem, tool_stream};
         use tokio_stream::wrappers::ReceiverStream;
 
         for _ in 0..32 {
@@ -3786,7 +3837,7 @@ You review code."#;
 
     #[tokio::test]
     async fn test_async_completion_before_load_replays_notifications() {
-        use crate::agents::tool_execution::{tool_stream, ToolStreamItem};
+        use crate::agents::tool_execution::{ToolStreamItem, tool_stream};
         use tokio_stream::wrappers::ReceiverStream;
 
         let client = Arc::new(SummonClient::new(create_test_context()).unwrap());
@@ -3801,6 +3852,7 @@ You review code."#;
                 turns_taken: 1,
                 duration: Duration::from_secs(1),
                 completed_at: Instant::now(),
+                status: TaskCompletionStatus::Completed,
                 notification_sink: buffered_notification_sink(buffered),
             },
         );
@@ -3850,6 +3902,7 @@ You review code."#;
                 turns_taken: 1,
                 duration: Duration::from_secs(1),
                 completed_at: Instant::now(),
+                status: TaskCompletionStatus::Completed,
                 notification_sink: buffered_notification_sink(vec![
                     test_tool_notification("inner-0", task_id),
                     test_tool_notification("inner-1", task_id),
@@ -3922,6 +3975,7 @@ You review code."#;
                 turns_taken: 1,
                 duration: Duration::from_secs(1),
                 completed_at: Instant::now(),
+                status: TaskCompletionStatus::Completed,
                 notification_sink: buffered_notification_sink(
                     (0..64)
                         .map(|index| test_tool_notification(&format!("inner-{index}"), task_id))
@@ -4011,6 +4065,7 @@ You review code."#;
                     turns_taken: 5,
                     duration: Duration::from_secs(60),
                     completed_at: Instant::now(),
+                    status: TaskCompletionStatus::Completed,
                     notification_sink: buffered_notification_sink(Vec::new()),
                 },
             );
@@ -4023,6 +4078,7 @@ You review code."#;
                     turns_taken: 3,
                     duration: Duration::from_secs(30),
                     completed_at: Instant::now(),
+                    status: TaskCompletionStatus::Completed,
                     notification_sink: buffered_notification_sink(Vec::new()),
                 },
             );
@@ -4057,11 +4113,13 @@ You review code."#;
         assert_eq!(result.status, "completed");
         assert_eq!(result.turns, Some(5));
 
-        assert!(!client
-            .completed_tasks
-            .lock()
-            .await
-            .contains_key("20260204_2"));
+        assert!(
+            !client
+                .completed_tasks
+                .lock()
+                .await
+                .contains_key("20260204_2")
+        );
 
         let result = client
             .handle_load_task_result("20260204_3", false, false, None)
@@ -4071,6 +4129,38 @@ You review code."#;
         assert!(text.contains("✗ Failed"));
         assert!(text.contains("Error: Something went wrong"));
         assert_eq!(result.status, "failed");
+
+        {
+            let mut completed = client.completed_tasks.lock().await;
+            completed.insert(
+                "20260204_4".to_string(),
+                CompletedTask {
+                    id: "20260204_4".to_string(),
+                    description: "Action-limited task".to_string(),
+                    result: Ok(format!(
+                        "{}? Would you like me to continue?",
+                        ACTION_LIMIT_MESSAGE
+                    )),
+                    turns_taken: 28,
+                    duration: Duration::from_secs(568),
+                    completed_at: Instant::now(),
+                    status: TaskCompletionStatus::ActionLimitReached,
+                    notification_sink: buffered_notification_sink(Vec::new()),
+                },
+            );
+        }
+
+        let moim = client.get_moim("test", &[]).await.unwrap();
+        assert!(moim.contains("action limit reached"));
+
+        let result = client
+            .handle_load_task_result("20260204_4", false, false, None)
+            .await
+            .unwrap();
+        let text = extract_text(&result.content[0]);
+        assert!(text.contains("⚠ Action limit reached"));
+        assert!(!text.contains("**Status:** ✓ Completed"));
+        assert_eq!(result.status, "action_limit_reached");
 
         let result = client
             .handle_load_task_result("20260204_3", false, false, None)
@@ -4587,6 +4677,7 @@ You review code."#;
                     turns_taken: 4,
                     duration: Duration::from_secs(30),
                     completed_at: Instant::now(),
+                    status: TaskCompletionStatus::Completed,
                     notification_sink: buffered_notification_sink(Vec::new()),
                 },
             );
@@ -4602,11 +4693,13 @@ You review code."#;
         assert!(text.contains("final output"));
 
         // Peek must be non-destructive: the result is still retrievable afterwards.
-        assert!(client
-            .completed_tasks
-            .lock()
-            .await
-            .contains_key("20260204_1"));
+        assert!(
+            client
+                .completed_tasks
+                .lock()
+                .await
+                .contains_key("20260204_1")
+        );
         let result = client
             .handle_load_task_result("20260204_1", false, false, None)
             .await
