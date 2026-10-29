@@ -104,6 +104,7 @@ use crate::execution::StartRunError;
 mod apps;
 mod config;
 mod custom_dispatch;
+mod delegated_tasks;
 mod diagnostics;
 mod dictation;
 mod dispatch;
@@ -368,6 +369,7 @@ fn meta_string(
 fn agent_capabilities_meta() -> Option<Meta> {
     let mut goose = serde_json::Map::new();
     goose.insert("recipeParameterScopes".to_string(), serde_json::json!({}));
+    goose.insert("delegatedTaskOutbox".to_string(), serde_json::json!(true));
     if cfg!(feature = "local-inference") {
         goose.insert("localInference".to_string(), serde_json::json!({}));
     }

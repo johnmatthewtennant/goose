@@ -1,3 +1,4 @@
+pub(crate) mod delegated_tasks;
 mod chat_history_search;
 mod diagnostics;
 mod export_html;

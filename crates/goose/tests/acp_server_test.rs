@@ -1317,3 +1317,108 @@ fn test_shell_terminal_false() {
 fn test_shell_terminal_true() {
     run_test(async { run_shell_terminal_true::<AcpServerConnection>().await });
 }
+
+#[test]
+fn delegated_completion_outbox_is_available_after_parent_prompt_ends() {
+    run_test(async {
+        use common_tests::fixtures::send_custom;
+        use goose_test_support::IgnoreSessionId;
+        let root = tempfile::tempdir().unwrap();
+        let tool_response = Box::leak(format!("data: {}\n\ndata: [DONE]\n", serde_json::json!({
+            "id": "delegate", "object": "chat.completion.chunk", "created": 0, "model": "gpt-4o-mini",
+            "choices": [{ "index": 0, "delta": { "role": "assistant", "tool_calls": [{
+                "index": 0, "id": "delegate-call", "type": "function", "function": {
+                    "name": "delegate", "arguments": serde_json::json!({ "instructions": "worker-checkpoint-marker", "async": true, "max_turns": 1 }).to_string()
+                }
+            }] }, "finish_reason": "tool_calls" }]
+        })).into_boxed_str());
+        let openai = OpenAiFixture::new(
+            vec![
+                ("start-delegate-marker".into(), tool_response),
+                (
+                    "start-delegate-marker".into(),
+                    include_str!("acp_test_data/openai_basic.txt"),
+                ),
+                (
+                    "worker-checkpoint-marker".into(),
+                    include_str!("acp_test_data/openai_basic.txt"),
+                ),
+            ],
+            std::sync::Arc::new(IgnoreSessionId),
+        )
+        .await;
+        let mut conn = AcpServerConnection::new(
+            TestConnectionConfig {
+                data_root: root.path().to_path_buf(),
+                builtins: vec!["summon".into()],
+                disable_session_naming: true,
+                ..Default::default()
+            },
+            openai,
+        )
+        .await;
+        let SessionData { mut session, .. } = conn.new_session().await.unwrap();
+        let parent = session.session_id().0.to_string();
+        let _output = session
+            .prompt("start-delegate-marker", PermissionDecision::AllowAlways)
+            .await
+            .unwrap();
+        // The parent is idle. No load call or second prompt drives completion.
+        let pending = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let pending = send_custom(
+                    conn.cx(),
+                    "_goose/unstable/session/delegated-tasks/pending",
+                    serde_json::json!({ "parentSessionIds": [parent] }),
+                )
+                .await
+                .unwrap();
+                if !pending["events"].as_array().unwrap().is_empty() {
+                    break pending;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let event = &pending["events"][0];
+        assert_eq!(event["parentSessionId"], parent);
+        assert_eq!(event["status"], "completed");
+        let task = event["taskId"].as_str().unwrap();
+        send_custom(
+            conn.cx(),
+            "_goose/unstable/session/delegated-tasks/acknowledge",
+            serde_json::json!({ "parentSessionId": parent, "taskId": task }),
+        )
+        .await
+        .unwrap();
+        let pending = send_custom(
+            conn.cx(),
+            "_goose/unstable/session/delegated-tasks/pending",
+            serde_json::json!({ "parentSessionIds": [parent] }),
+        )
+        .await
+        .unwrap();
+        assert!(pending["events"].as_array().unwrap().is_empty());
+        let manager = SessionManager::new(root.path().to_path_buf());
+        let child = manager.get_session(task, true).await.unwrap();
+        assert_eq!(child.parent_session_id.as_deref(), Some(parent.as_str()));
+        let pool = sqlx::SqlitePool::connect(&format!(
+            "sqlite:{}",
+            root.path().join("sessions/sessions.db").display()
+        ))
+        .await
+        .unwrap();
+        let output: String = sqlx::query_scalar("SELECT output FROM delegated_task_outbox")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(output, "2");
+        let recovered_parent = new_connection(root.path()).await;
+        let loaded = send_custom(recovered_parent.cx(), "_goose/unstable/tools/call", serde_json::json!({
+            "sessionId": parent, "extensionName": "summon", "name": "load", "arguments": { "source": task, "peek": true }
+        })).await.unwrap();
+        assert!(loaded.to_string().contains("2"));
+        assert!(child.conversation.unwrap().messages().iter().any(|message| message.content.iter().any(|content| matches!(content, goose::conversation::message::MessageContent::Text(text) if text.text == "2"))));
+    });
+}

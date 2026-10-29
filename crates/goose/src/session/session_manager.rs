@@ -986,6 +986,11 @@ impl SessionStorage {
                         warn!("Failed to import some legacy sessions: {}", e);
                     }
                 }
+                sqlx::query("CREATE TABLE IF NOT EXISTS delegated_task_outbox (
+                    task_id TEXT PRIMARY KEY, parent_session_id TEXT NOT NULL,
+                    description TEXT NOT NULL, status TEXT NOT NULL, output TEXT NOT NULL,
+                    acknowledged INTEGER NOT NULL DEFAULT 0, result_consumed INTEGER NOT NULL DEFAULT 0
+                )").execute(&self.pool).await?;
                 Ok::<(), anyhow::Error>(())
             })
             .await?;

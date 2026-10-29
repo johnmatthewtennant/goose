@@ -56,12 +56,16 @@ pub async fn run_subagent_task(params: SubagentRunParams) -> Result<String, anyh
     if let Some(output) = final_output {
         return Ok(output);
     }
-
     Ok(extract_response_text(&messages, return_last_only))
 }
 
 fn extract_response_text(messages: &Conversation, return_last_only: bool) -> String {
-    if return_last_only {
+    // The action-limit prompt is not a handoff. Retain progress and tool results.
+    let action_limited = messages.messages().last().is_some_and(|message| {
+        message.content.iter().any(|content| matches!(content,
+            MessageContent::Text(text) if text.text == crate::agents::state_machine::MAX_TURNS_MESSAGE))
+    });
+    if return_last_only && !action_limited {
         messages
             .messages()
             .last()
@@ -360,5 +364,25 @@ mod tests {
     fn create_tool_notification_ignores_non_tool_request() {
         let content = MessageContent::text("hello");
         assert!(create_tool_notification(&content, "session_1").is_none());
+    }
+}
+
+#[cfg(test)]
+mod action_limit_checkpoint_tests {
+    use super::*;
+
+    #[test]
+    fn action_limit_retains_worker_progress() {
+        let messages = Conversation::new_unvalidated(vec![
+            Message::assistant()
+                .with_text("Inspected the parser. The remaining fix belongs in parse_options."),
+            Message::assistant().with_text(crate::agents::state_machine::MAX_TURNS_MESSAGE),
+        ]);
+        let output = extract_response_text(&messages, true);
+        assert!(
+            output.contains("remaining fix belongs in parse_options"),
+            "action-limit output discarded worker progress: {output}"
+        );
+        assert!(output.contains("maximum number of actions"));
     }
 }

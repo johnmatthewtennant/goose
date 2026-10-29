@@ -10,6 +10,9 @@ impl GooseAcpAgent {
         params: serde_json::Value,
     ) -> Result<serde_json::Value, agent_client_protocol::Error> {
         let result = async {
+            if let Some(action) = method.strip_prefix("_goose/unstable/session/delegated-tasks/") {
+                return self.dispatch_delegated_task_outbox(action, params).await;
+            }
             if <SaveRecipeRequest as agent_client_protocol::JsonRpcMessage>::matches_method(method)
             {
                 let req = recipe::deserialize_save_recipe_request(params)?;

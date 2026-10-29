@@ -1,21 +1,22 @@
-use crate::agents::AgentConfig;
 use crate::agents::extension::PlatformExtensionContext;
 use crate::agents::mcp_client::{Error, McpClientTrait};
-use crate::agents::subagent_handler::{OnMessageCallback, SubagentRunParams, run_subagent_task};
-use crate::agents::subagent_task_config::{DEFAULT_SUBAGENT_MAX_TURNS, TaskConfig};
+use crate::agents::subagent_handler::{run_subagent_task, OnMessageCallback, SubagentRunParams};
+use crate::agents::subagent_task_config::{TaskConfig, DEFAULT_SUBAGENT_MAX_TURNS};
 use crate::agents::tool_execution::{ToolCallContext, ToolCallNotificationEmitter};
+use crate::agents::AgentConfig;
 use crate::config::paths::Paths;
 use crate::config::{Config, GooseMode};
 use crate::providers;
 use crate::recipe::build_recipe::build_recipe_from_template;
 use crate::recipe::local_recipes::load_local_recipe_file;
-use crate::recipe::{RECIPE_FILE_EXTENSIONS, Recipe, RecipeParameter, Settings};
-use crate::session::SessionType;
+use crate::recipe::{Recipe, RecipeParameter, Settings, RECIPE_FILE_EXTENSIONS};
 use crate::session::extension_data::EnabledExtensionsState;
+use crate::session::SessionType;
 use crate::sources::parse_frontmatter;
 use crate::utils::safe_truncate;
 use anyhow::Result;
 use async_trait::async_trait;
+use futures::FutureExt;
 use goose_agent::operation::messages_since_kickoff;
 use goose_sdk_types::custom_requests::{SourceEntry, SourceType};
 use rmcp::model::{
@@ -26,8 +27,8 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
@@ -116,6 +117,56 @@ where
     (handle, completion_token)
 }
 
+fn spawn_owned_background_task<F>(
+    future: F,
+    manager: Arc<crate::session::SessionManager>,
+    parent_session_id: String,
+    task_id: String,
+    description: String,
+    cancellation: CancellationToken,
+) -> (JoinHandle<Result<String>>, CancellationToken)
+where
+    F: Future<Output = Result<String>> + Send + 'static,
+{
+    spawn_background_task(async move {
+        let result = match std::panic::AssertUnwindSafe(future).catch_unwind().await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!("Task panicked: background worker panicked")),
+        };
+        let status = if cancellation.is_cancelled() {
+            "cancelled"
+        } else {
+            match &result {
+                Ok(output) => {
+                    task_status_key(completion_status_for_output(output), &Ok(output.clone()))
+                }
+                Err(error) if error.to_string().starts_with("Task panicked:") => "panicked",
+                Err(_) => "failed",
+            }
+        };
+        let event = crate::session::delegated_tasks::DelegatedTaskEvent {
+            parent_session_id,
+            task_id,
+            description,
+            status: status.to_string(),
+        };
+        let output = match &result {
+            Ok(output) => output.clone(),
+            Err(error) => error.to_string(),
+        };
+        loop {
+            match manager.record_delegated_task(&event, &output).await {
+                Ok(()) => break,
+                Err(error) => {
+                    warn!(task_id = %event.task_id, %error, "Failed to persist worker completion; retrying");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+        result
+    })
+}
+
 pub struct CompletedTask {
     pub id: String,
     pub description: String,
@@ -149,6 +200,7 @@ fn task_status_label(
     result: &Result<String, String>,
 ) -> &'static str {
     match (status, result) {
+        (_, Err(error)) if error.starts_with("Task panicked:") => "✗ Panicked",
         (_, Err(_)) => "✗ Failed",
         (TaskCompletionStatus::ActionLimitReached, Ok(_)) => "⚠ Action limit reached",
         (TaskCompletionStatus::Completed, Ok(_)) => "✓ Completed",
@@ -1074,9 +1126,44 @@ impl SummonClient {
         let name = source_name.unwrap();
 
         if is_session_id(name) {
-            let task_result = self
+            let task_result = match self
                 .handle_load_task_result(name, cancel, peek, notification_emitter)
-                .await?;
+                .await
+            {
+                Ok(result) => {
+                    if !peek {
+                        self.context
+                            .session_manager
+                            .delegated_task_result(session_id, name, true)
+                            .await
+                            .map_err(|error| format!("Failed to mark task result read: {error}"))?;
+                    }
+                    result
+                }
+                Err(error) if error == format!("Task '{}' not found.", name) => {
+                    let Some((description, status, output)) = self
+                        .context
+                        .session_manager
+                        .delegated_task_result(session_id, name, !peek)
+                        .await
+                        .map_err(|error| format!("Failed to recover task result: {error}"))?
+                    else {
+                        return Err(error);
+                    };
+                    let status = match status.as_str() {
+                        "completed" => "completed",
+                        "action_limit_reached" => "action_limit_reached",
+                        "panicked" => "panicked",
+                        "cancelled" => "cancelled",
+                        _ => "failed",
+                    };
+                    TaskLoadResult {
+                        content: vec![ContentBlock::text(format!("# Background Task Result: {name}\n\n**Task:** {description}\n**Status:** {status}\n\n## Output\n\n{output}"))],
+                        status, turns: None, duration_secs: None,
+                    }
+                }
+                Err(error) => return Err(error),
+            };
             let mut meta = MetaObject::new();
             meta.0.insert(
                 "subagent_session_id".to_string(),
@@ -2164,24 +2251,34 @@ impl SummonClient {
         let notification_sink = Self::notification_sink(None);
         let task_notification_sink = Arc::clone(&notification_sink);
 
-        let (handle, completion_token) = spawn_background_task(async move {
-            let params = SubagentRunParams {
-                config: agent_config,
-                recipe,
-                task_config,
-                return_last_only: true,
-                session_id: subagent_session.id,
-                cancellation_token: Some(task_token_clone),
-                on_message: Some(on_message),
-                notification_tx: None,
-            };
-            Self::run_subagent_with_notifications(task_notification_sink, move |notification_tx| {
-                let mut params = params;
-                params.notification_tx = Some(notification_tx);
-                run_subagent_task(params)
-            })
-            .await
-        });
+        let (handle, completion_token) = spawn_owned_background_task(
+            async move {
+                let params = SubagentRunParams {
+                    config: agent_config,
+                    recipe,
+                    task_config,
+                    return_last_only: true,
+                    session_id: subagent_session.id,
+                    cancellation_token: Some(task_token_clone),
+                    on_message: Some(on_message),
+                    notification_tx: None,
+                };
+                Self::run_subagent_with_notifications(
+                    task_notification_sink,
+                    move |notification_tx| {
+                        let mut params = params;
+                        params.notification_tx = Some(notification_tx);
+                        run_subagent_task(params)
+                    },
+                )
+                .await
+            },
+            Arc::clone(&self.context.session_manager),
+            session_id.to_string(),
+            task_id.clone(),
+            description.clone(),
+            task_token.clone(),
+        );
 
         let task = BackgroundTask {
             id: task_id.clone(),
@@ -3668,11 +3765,9 @@ You review code."#;
             )
             .unwrap_err();
 
-        assert!(
-            error
-                .to_string()
-                .contains("No model configured for provider 'lmstudio'")
-        );
+        assert!(error
+            .to_string()
+            .contains("No model configured for provider 'lmstudio'"));
     }
 
     fn test_tool_notification(request_id: &str, subagent_id: &str) -> ServerNotification {
@@ -3783,7 +3878,7 @@ You review code."#;
 
     #[tokio::test]
     async fn test_live_notifications_precede_delegate_result() {
-        use crate::agents::tool_execution::{ToolStreamItem, tool_stream};
+        use crate::agents::tool_execution::{tool_stream, ToolStreamItem};
         use tokio_stream::wrappers::ReceiverStream;
 
         for _ in 0..32 {
@@ -3837,7 +3932,7 @@ You review code."#;
 
     #[tokio::test]
     async fn test_async_completion_before_load_replays_notifications() {
-        use crate::agents::tool_execution::{ToolStreamItem, tool_stream};
+        use crate::agents::tool_execution::{tool_stream, ToolStreamItem};
         use tokio_stream::wrappers::ReceiverStream;
 
         let client = Arc::new(SummonClient::new(create_test_context()).unwrap());
@@ -3997,6 +4092,105 @@ You review code."#;
     }
 
     #[tokio::test]
+    async fn terminal_outbox_classifies_failure_panic_cancellation_and_action_limit() {
+        let data = TempDir::new().unwrap();
+        let manager = Arc::new(crate::session::SessionManager::new(
+            data.path().to_path_buf(),
+        ));
+        for status in ["failed", "panicked", "cancelled", "action_limit_reached"] {
+            let cancellation = CancellationToken::new();
+            if status == "cancelled" {
+                cancellation.cancel();
+            }
+            let (handle, _) = spawn_owned_background_task(
+                async move {
+                    match status {
+                        "failed" => Err(anyhow::anyhow!("provider failed")),
+                        "panicked" => panic!("worker crashed"),
+                        "action_limit_reached" => {
+                            Ok(crate::agents::state_machine::MAX_TURNS_MESSAGE.into())
+                        }
+                        _ => Ok("stopped".into()),
+                    }
+                },
+                manager.clone(),
+                "owner".into(),
+                status.into(),
+                "work".into(),
+                cancellation,
+            );
+            let _ = handle.await.unwrap();
+        }
+        let events = manager
+            .pending_delegated_tasks(&["owner".into()])
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 4);
+        for event in events {
+            assert_eq!(event.task_id, event.status);
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_outbox_wakes_idle_owner_without_cleanup_and_preserves_result() {
+        let data = TempDir::new().unwrap();
+        let manager = Arc::new(crate::session::SessionManager::new(
+            data.path().to_path_buf(),
+        ));
+        let client =
+            SummonClient::new(create_test_context_with_session_manager(manager.clone())).unwrap();
+        let (handle, done) = spawn_owned_background_task(
+            async { Ok("worker checkpoint".to_string()) },
+            manager.clone(),
+            "parent-id".into(),
+            "worker-id".into(),
+            "Inspect parser".into(),
+            CancellationToken::new(),
+        );
+        client.background_tasks.lock().await.insert(
+            "worker-id".into(),
+            BackgroundTask {
+                id: "worker-id".into(),
+                description: "Inspect parser".into(),
+                started_at: Instant::now(),
+                turns: Arc::new(AtomicU32::new(0)),
+                last_activity: Arc::new(AtomicU64::new(0)),
+                handle,
+                cancellation_token: CancellationToken::new(),
+                completion_token: done.clone(),
+                notification_sink: buffered_notification_sink(vec![]),
+            },
+        );
+        done.cancelled().await;
+        // No cleanup, load, or parent turn is allowed to produce the event.
+        let pool = manager.storage().pool().await.unwrap();
+        let table: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = ?)")
+                .bind("delegated_task_outbox")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert!(
+            table,
+            "worker completion has no independently persisted parent delivery"
+        );
+        let owner: String = sqlx::query_scalar(
+            "SELECT parent_session_id FROM delegated_task_outbox WHERE task_id = ?",
+        )
+        .bind("worker-id")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        assert_eq!(owner, "parent-id");
+        client.cleanup_completed_tasks().await;
+        let result = client
+            .handle_load_task_result("worker-id", false, true, None)
+            .await
+            .unwrap();
+        assert!(extract_text(&result.content[0]).contains("worker checkpoint"));
+    }
+
+    #[tokio::test]
     async fn test_async_task_result_lifecycle() {
         let client = SummonClient::new(create_test_context()).unwrap();
         let temp_dir = TempDir::new().unwrap();
@@ -4113,13 +4307,11 @@ You review code."#;
         assert_eq!(result.status, "completed");
         assert_eq!(result.turns, Some(5));
 
-        assert!(
-            !client
-                .completed_tasks
-                .lock()
-                .await
-                .contains_key("20260204_2")
-        );
+        assert!(!client
+            .completed_tasks
+            .lock()
+            .await
+            .contains_key("20260204_2"));
 
         let result = client
             .handle_load_task_result("20260204_3", false, false, None)
@@ -4693,13 +4885,11 @@ You review code."#;
         assert!(text.contains("final output"));
 
         // Peek must be non-destructive: the result is still retrievable afterwards.
-        assert!(
-            client
-                .completed_tasks
-                .lock()
-                .await
-                .contains_key("20260204_1")
-        );
+        assert!(client
+            .completed_tasks
+            .lock()
+            .await
+            .contains_key("20260204_1"));
         let result = client
             .handle_load_task_result("20260204_1", false, false, None)
             .await
