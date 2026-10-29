@@ -1522,3 +1522,181 @@ fn test_manual_compaction_refusal_fails_without_replacing_context() {
         );
     });
 }
+
+/// Real MCP output must survive a subsequent Responses stream failure and a
+/// successful follow-up turn, without replaying or duplicating the tool result.
+async fn assert_responses_failure_after_mcp(partial_eof: bool) {
+    use serde_json::json;
+    use wiremock::ResponseTemplate;
+
+    let response = |status, output| {
+        json!({
+            "id": "resp_posttool", "object": "response", "created_at": 1,
+            "status": status, "model": "gpt-5.2", "output": output,
+            "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+        })
+    };
+    let sse = |events: Vec<serde_json::Value>| {
+        events
+            .into_iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect::<String>()
+    };
+    let created = json!({"type": "response.created", "sequence_number": 1,
+        "response": response("in_progress", json!([]))});
+    let tool_response = sse(vec![
+        created.clone(),
+        json!({
+            "type": "response.completed", "sequence_number": 2,
+            "response": response("completed", json!([{
+                "type": "function_call", "call_id": "call_posttool",
+                "name": "mcp-fixture__get_code", "arguments": "{}"
+            }]))
+        }),
+    ]);
+    let failure = if partial_eof {
+        json!({"type": "response.output_text.delta", "sequence_number": 2,
+            "item_id": "msg_posttool", "output_index": 0, "content_index": 0,
+            "delta": "Working on it"})
+    } else {
+        json!({"type": "error", "code": "server_is_overloaded",
+            "message": "Our servers are currently overloaded. Please try again later.",
+            "param": null, "sequence_number": 2})
+    };
+    let stream = |events| {
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string(sse(events))
+    };
+    let openai = OpenAiFixture::responses_after_tool_with_recovery(
+        tool_response,
+        stream(vec![created.clone(), failure]),
+        Some(stream(vec![
+            created,
+            json!({
+                "type": "response.completed", "sequence_number": 2,
+                "response": response("completed", json!([{
+                    "type": "message", "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Finished successfully."}]
+                }]))
+            }),
+        ])),
+    )
+    .await;
+    let mcp = McpFixture::new().await;
+    let mut conn = <AcpServerConnection as Connection>::new(
+        TestConnectionConfig {
+            current_model: "gpt-5.2".to_string(),
+            mcp_servers: vec![McpServer::Http(McpServerHttp::new("mcp-fixture", &mcp.url))],
+            ..Default::default()
+        },
+        openai,
+    )
+    .await;
+    let SessionData { mut session, .. } = conn.new_session().await.unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        session.prompt(
+            "Use get_code, then report completion.",
+            PermissionDecision::Cancel,
+        ),
+    )
+    .await
+    .expect("post-tool provider failure must terminate the ACP prompt");
+    let error =
+        prompt_acp_error(result.expect_err("provider failure must reject ACP, not return EndTurn"));
+    assert_eq!(error.code, ErrorCode::InternalError);
+    assert_eq!(error.data.as_ref().unwrap()["reason"], "turn_failed");
+    if !partial_eof {
+        assert!(
+            serde_json::to_string(&error)
+                .unwrap()
+                .contains("server_is_overloaded"),
+            "{error:?}"
+        );
+    }
+    let stored = SessionManager::new(conn.data_root())
+        .get_session(&session.session_id().0, true)
+        .await
+        .unwrap();
+    let conversation = stored.conversation.unwrap();
+    assert!(
+        conversation
+            .messages()
+            .iter()
+            .any(|message| message.error_kind().is_some()),
+        "the error must be saved before ACP rejects"
+    );
+    if partial_eof {
+        assert!(
+            conversation
+                .messages()
+                .iter()
+                .any(|message| message.as_concat_text().contains("Working on it")),
+            "partial output must survive EOF"
+        );
+    }
+    let mut notifications = session.notifications();
+    let recovered = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        session.prompt(
+            "Recover the failed provider turn",
+            PermissionDecision::Cancel,
+        ),
+    )
+    .await
+    .expect("a follow-up turn must terminate")
+    .expect("a successful follow-up must not reject ACP");
+    assert_eq!(recovered.text, "Finished successfully.");
+    notifications.extend(session.notifications());
+    assert_eq!(
+        notifications
+            .iter()
+            .filter(|notification| matches!(
+                notification,
+                common_tests::fixtures::Notification::ToolCallStatus(
+                    agent_client_protocol::schema::v1::ToolCallStatus::Completed
+                )
+            ))
+            .count(),
+        1,
+        "the MCP tool must complete exactly once across failure and recovery"
+    );
+    let stored = SessionManager::new(conn.data_root())
+        .get_session(&session.session_id().0, true)
+        .await
+        .unwrap();
+    let conversation = stored.conversation.unwrap();
+    assert!(
+        conversation
+            .messages()
+            .iter()
+            .any(|message| message.error_kind().is_some()),
+        "the recovered session must retain its provider error"
+    );
+    assert_eq!(
+        conversation
+            .messages()
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|content| content.as_tool_response_text())
+            .filter(|text| text.contains(FAKE_CODE))
+            .count(),
+        1,
+        "the real MCP result must be saved exactly once"
+    );
+    assert_eq!(
+        conversation.messages().last().unwrap().as_concat_text(),
+        "Finished successfully."
+    );
+}
+
+#[test]
+fn test_responses_flat_overload_after_mcp_and_recovery() {
+    run_test(async { assert_responses_failure_after_mcp(false).await });
+}
+
+#[test]
+fn test_responses_partial_eof_after_mcp_and_recovery() {
+    run_test(async { assert_responses_failure_after_mcp(true).await });
+}
