@@ -200,7 +200,11 @@ fn classify_outcome(
     run_result: Result<()>,
 ) -> SubagentOutcome {
     if stopped {
-        return SubagentOutcome::Cancelled;
+        // Resume rejects workers with saved output, so calling them cancelled would strand them.
+        return match conversation.and_then(saved_outcome) {
+            Some(outcome @ SubagentOutcome::Completed(_)) => outcome,
+            _ => SubagentOutcome::Cancelled,
+        };
     }
     let messages = conversation
         .map(Conversation::messages)
@@ -511,7 +515,7 @@ mod outcome_tests {
     }
 
     #[test]
-    fn stream_error_and_cancellation_precede_saved_output() {
+    fn stream_error_precedes_saved_output_but_stop_keeps_it() {
         let saved = successful();
         assert!(
             matches!(classify_outcome(Some(&saved), false, Err(anyhow!("stream disconnected"))),
@@ -519,6 +523,10 @@ mod outcome_tests {
         );
         assert_eq!(
             classify_outcome(Some(&saved), true, Ok(())),
+            saved_outcome(&saved).unwrap()
+        );
+        assert_eq!(
+            classify_outcome(Some(&Conversation::empty()), true, Ok(())),
             SubagentOutcome::Cancelled
         );
     }
@@ -587,10 +595,7 @@ mod outcome_tests {
         saved.push(Message::assistant().with_text("addressed feedback"));
         assert_eq!(saved_outcome(&saved), Some(expected.clone()));
         assert_eq!(classify_outcome(Some(&saved), false, Ok(())), expected);
-        assert_eq!(
-            classify_outcome(Some(&saved), true, Ok(())),
-            SubagentOutcome::Cancelled
-        );
+        assert_eq!(classify_outcome(Some(&saved), true, Ok(())), expected);
         assert!(matches!(
             classify_outcome(Some(&saved), false, Err(anyhow!("stream disconnected"))),
             SubagentOutcome::Failed(reason) if reason.contains("stream disconnected")
