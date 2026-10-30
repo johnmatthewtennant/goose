@@ -118,8 +118,18 @@ impl SubagentRunner<Session> for ForegroundSubagentRunner {
         if cancel.is_cancelled() {
             return ended(SubagentOutcome::Cancelled);
         }
-        if let Some(outcome) = subagent.conversation.as_ref().and_then(saved_outcome) {
-            return ended(outcome);
+        if let Some(conversation) = subagent.conversation.as_ref() {
+            // The state machine owns reactive compaction and its retry limit.
+            let needs_compaction = matches!(
+                conversation.terminal_error(),
+                Some(MessageContent::Error(error))
+                    if error.kind == crate::conversation::message::MessageErrorKind::ContextLengthExceeded
+            );
+            if !needs_compaction {
+                if let Some(outcome) = saved_outcome(conversation) {
+                    return ended(outcome);
+                }
+            }
         }
         let task = subagent
             .recipe
@@ -228,6 +238,9 @@ mod tests {
                 SessionType::SubAgent,
                 GooseMode::Auto,
             )
+            .await?;
+        manager
+            .add_message(&subagent.id, &Message::user().with_text("task"))
             .await?;
         manager
             .update(&subagent.id)
@@ -431,6 +444,131 @@ mod tests {
                 "notice={notice}: {updates:?}"
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn saved_context_error_reaches_the_worker_state_machine() -> Result<()> {
+        let fixture = fixture().await?;
+        save_final_output(&fixture.manager, &fixture.subagent_id).await?;
+        fixture
+            .manager
+            .add_message(
+                &fixture.subagent_id,
+                &Message::assistant().with_error(
+                    crate::conversation::message::MessageErrorKind::ContextLengthExceeded,
+                    "recoverable overflow",
+                ),
+            )
+            .await?;
+        let parent = fixture
+            .manager
+            .get_session(&fixture.parent_id, true)
+            .await?;
+        let updates: Vec<_> = fixture
+            .runner()
+            .start(&parent, &fixture.subagent_id, CancellationToken::new())
+            .await
+            .collect()
+            .await;
+        assert!(
+            matches!(updates.first(), Some(SubagentUpdate::ToParent(_))),
+            "{updates:?}"
+        );
+        assert!(
+            matches!(updates.last(), Some(SubagentUpdate::Finished(SubagentOutcome::Failed(reason)))
+            if reason.contains("no saved recipe")),
+            "{updates:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resumed_worker_does_not_complete_with_historical_output() -> Result<()> {
+        let fixture = fixture().await?;
+        save_final_output(&fixture.manager, &fixture.subagent_id).await?;
+        fixture
+            .manager
+            .add_message(
+                &fixture.subagent_id,
+                &Message::assistant().with_error(
+                    crate::conversation::message::MessageErrorKind::Other,
+                    "provider exhausted",
+                ),
+            )
+            .await?;
+        fixture
+            .manager
+            .add_message(
+                &fixture.subagent_id,
+                &Message::user().with_text("Try again"),
+            )
+            .await?;
+        let parent = fixture
+            .manager
+            .get_session(&fixture.parent_id, true)
+            .await?;
+        let updates: Vec<_> = fixture
+            .runner()
+            .start(&parent, &fixture.subagent_id, CancellationToken::new())
+            .await
+            .collect()
+            .await;
+        assert!(
+            matches!(updates.first(), Some(SubagentUpdate::ToParent(_))),
+            "{updates:?}"
+        );
+        assert!(
+            matches!(updates.last(), Some(SubagentUpdate::Finished(SubagentOutcome::Failed(reason)))
+            if reason.contains("no saved recipe")),
+            "{updates:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn worker_output_is_scoped_to_the_current_attempt() -> Result<()> {
+        let fixture = fixture().await?;
+        fixture
+            .manager
+            .add_message(
+                &fixture.subagent_id,
+                &Message::user().with_text("First attempt"),
+            )
+            .await?;
+        save_final_output(&fixture.manager, &fixture.subagent_id).await?;
+        for instructions in ["Try again", "Continue without a final output"] {
+            fixture
+                .manager
+                .add_message(
+                    &fixture.subagent_id,
+                    &Message::user().with_text(instructions),
+                )
+                .await?;
+            fixture
+                .manager
+                .add_message(
+                    &fixture.subagent_id,
+                    &Message::assistant().with_text("Still working"),
+                )
+                .await?;
+            let child = fixture
+                .manager
+                .get_session(&fixture.subagent_id, true)
+                .await?;
+            assert!(saved_outcome(child.conversation.as_ref().unwrap()).is_none());
+        }
+        save_final_output(&fixture.manager, &fixture.subagent_id).await?;
+        let child = fixture
+            .manager
+            .get_session(&fixture.subagent_id, true)
+            .await?;
+        assert_eq!(
+            saved_outcome(child.conversation.as_ref().unwrap()),
+            Some(SubagentOutcome::Completed(
+                r#"{"summary":"done"}"#.to_string()
+            ))
+        );
         Ok(())
     }
 
