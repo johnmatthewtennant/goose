@@ -115,6 +115,10 @@ impl ForegroundSubagentRunner {
         cancel: CancellationToken,
         to_parent: &mpsc::UnboundedSender<Message>,
     ) -> Result<()> {
+        // A stop before the run starts is not a failure.
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
         let parent_id = subagent
             .parent_session_id
             .as_deref()
@@ -201,8 +205,9 @@ fn classify_outcome(
 ) -> SubagentOutcome {
     if stopped {
         // Resume rejects workers with saved output, so calling them cancelled would strand them.
-        return match conversation.and_then(saved_outcome) {
-            Some(outcome @ SubagentOutcome::Completed(_)) => outcome,
+        // A failed run still never reports success.
+        return match (run_result, conversation.and_then(saved_outcome)) {
+            (Ok(()), Some(outcome @ SubagentOutcome::Completed(_))) => outcome,
             _ => SubagentOutcome::Cancelled,
         };
     }
@@ -527,6 +532,10 @@ mod outcome_tests {
         );
         assert_eq!(
             classify_outcome(Some(&Conversation::empty()), true, Ok(())),
+            SubagentOutcome::Cancelled
+        );
+        assert_eq!(
+            classify_outcome(Some(&saved), true, Err(anyhow!("session load failed"))),
             SubagentOutcome::Cancelled
         );
     }
